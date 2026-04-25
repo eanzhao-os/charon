@@ -35,7 +35,7 @@
 | env | 默认 | 谁用 |
 |---|---|---|
 | `CHARON_HOME` | `~/.charon` | workspaces.json + worktrees/ + (M2.6) config.toml 都在这下面 |
-| `CHARON_OWNER_USER_ID` | （从 M2.6 config.toml 读） | 单用户校验 — 只接受 JWT `sub == owner` 的请求 |
+| `CHARON_OWNER_USER_ID` | 必填（M2.6 后可从 config.toml 读） | 单用户校验 — 只接受 JWT `sub == owner` 的请求 |
 
 ---
 

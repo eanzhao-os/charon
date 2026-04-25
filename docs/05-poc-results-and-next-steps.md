@@ -165,9 +165,18 @@ All checks passed.
 | `CHARON_BIND` | `127.0.0.1:18789` | daemon 监听地址 |
 | `CHARON_EXPECTED_AUD` | `http://localhost:18789` | JWT `aud` 校验值（必须 == UserService endpoint URL） |
 | `CHARON_NYXID_ISSUER` | `https://nyx-api.chrono-ai.fun` | OIDC discovery / JWT `iss` 校验值 |
+| `CHARON_OWNER_USER_ID` | 无，必填 | daemon 单 owner 授权；workspace/file/diff/WS 只接受 JWT `sub == owner` |
 | `CHARON_ENDPOINT` | `http://127.0.0.1:18789` | doctor 探本地 daemon |
 | `CHARON_NYXID_BASE_URL` | `https://nyx-api.chrono-ai.fun` | doctor 走的 proxy 根 URL（M1 等于 issuer） |
 | `CHARON_DOCTOR_SLUG` | `charon-echo-poc` | doctor 经 proxy 打的 UserService slug |
+
+第一次升级后如果还不知道自己的 NyxID `user_id`，可以先用临时值启动 daemon，只打 `/whoami` 拿真实值，再改成真实 owner 重启：
+
+```bash
+CHARON_OWNER_USER_ID=bootstrap cargo run -p charon-daemon
+curl -H "Authorization: Bearer $(cat ~/.nyxid/access_token)" \
+  https://nyx-api.chrono-ai.fun/api/v1/proxy/s/charon-echo-poc/api/v1/whoami
+```
 
 ### #3 端到端验证
 

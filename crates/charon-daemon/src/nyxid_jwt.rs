@@ -76,6 +76,42 @@ pub enum JwtError {
     JwksStatus(reqwest::StatusCode),
 }
 
+#[derive(Debug, Error)]
+pub enum OwnerAuthError {
+    #[error("owner user id must not be empty")]
+    EmptyOwnerUserId,
+    #[error("identity user_id '{actual}' is not configured owner")]
+    UserMismatch { actual: String },
+}
+
+#[derive(Debug)]
+pub struct OwnerAuthorizer {
+    owner_user_id: String,
+}
+
+impl OwnerAuthorizer {
+    pub fn new(owner_user_id: impl Into<String>) -> Result<Self, OwnerAuthError> {
+        let owner_user_id = owner_user_id.into().trim().to_string();
+        if owner_user_id.is_empty() {
+            return Err(OwnerAuthError::EmptyOwnerUserId);
+        }
+        Ok(Self { owner_user_id })
+    }
+
+    pub fn owner_user_id(&self) -> &str {
+        &self.owner_user_id
+    }
+
+    pub fn authorize(&self, identity: &NyxIdentity) -> Result<(), OwnerAuthError> {
+        if identity.user_id == self.owner_user_id {
+            return Ok(());
+        }
+        Err(OwnerAuthError::UserMismatch {
+            actual: identity.user_id.clone(),
+        })
+    }
+}
+
 pub struct JwksClient {
     issuer: String,
     expected_aud: String,
@@ -187,6 +223,29 @@ impl JwksClient {
     }
 }
 
+#[cfg(test)]
+impl JwksClient {
+    pub(crate) fn for_test(
+        issuer: impl Into<String>,
+        expected_aud: impl Into<String>,
+        kid: impl Into<String>,
+        key: Arc<DecodingKey>,
+    ) -> Self {
+        let mut keys = HashMap::new();
+        keys.insert(kid.into(), key);
+        Self {
+            issuer: issuer.into(),
+            expected_aud: expected_aud.into(),
+            http: reqwest::Client::new(),
+            inner: RwLock::new(Cache {
+                jwks_uri: "test://jwks".to_string(),
+                keys,
+                fetched_at: Instant::now(),
+            }),
+        }
+    }
+}
+
 async fn fetch_jwks(
     http: &reqwest::Client,
     jwks_uri: &str,
@@ -239,6 +298,8 @@ fn claims_to_identity(raw: RawClaims) -> NyxIdentity {
 
 pub struct IdentityToken(pub NyxIdentity);
 
+pub struct OwnerIdentity(pub NyxIdentity);
+
 impl<S> FromRequestParts<S> for IdentityToken
 where
     S: Send + Sync,
@@ -275,6 +336,31 @@ where
                 Err(reject(status, "invalid_token", e))
             }
         }
+    }
+}
+
+impl<S> FromRequestParts<S> for OwnerIdentity
+where
+    S: Send + Sync,
+    Arc<JwksClient>: FromRef<S>,
+    Arc<OwnerAuthorizer>: FromRef<S>,
+{
+    type Rejection = (StatusCode, Json<crate::ErrorBody>);
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let IdentityToken(identity) = IdentityToken::from_request_parts(parts, state).await?;
+        let owner: Arc<OwnerAuthorizer> = FromRef::from_ref(state);
+        owner.authorize(&identity).map_err(|e| {
+            warn!(user_id = %identity.user_id, error = %e, "rejecting non-owner request");
+            (
+                StatusCode::FORBIDDEN,
+                Json(crate::ErrorBody {
+                    error: "not_owner",
+                    message: e.to_string(),
+                }),
+            )
+        })?;
+        Ok(OwnerIdentity(identity))
     }
 }
 
