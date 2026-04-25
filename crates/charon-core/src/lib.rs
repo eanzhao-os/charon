@@ -6,11 +6,13 @@
 pub mod wire;
 
 pub use wire::{
-    ClientFrame, CreateWorkspaceRequest, DiffPayload, DiffResponse, DiffStatus, FileContent,
-    FileDiff, FileEntry, FileKind, FilePathPayload, FileTreePayload, FileTreeResponse,
-    FileWritePayload, HealthResponse, HelloPayload, ListWorkspacesResponse, NyxIdentity,
-    ServerFrame, ServerInfo, WhoAmIResponse, Workspace, WorkspaceIdPayload, WorkspaceListPayload,
-    WriteFileRequest, WsError,
+    ClientFrame, CreateTerminalPayload, CreateWorkspaceRequest, DiffPayload, DiffResponse,
+    DiffStatus, FileContent, FileDiff, FileEntry, FileKind, FilePathPayload, FileTreePayload,
+    FileTreeResponse, FileWritePayload, HealthResponse, HelloPayload, ListWorkspacesResponse,
+    NyxIdentity, ServerFrame, ServerInfo, Terminal, TerminalIdPayload, TerminalKeysAck,
+    TerminalKillAck, TerminalListPayload, TerminalListResponse, TerminalResizeAck,
+    TerminalResizePayload, TerminalScrollbackResponse, TerminalSendKeysPayload, TerminalStatus,
+    WhoAmIResponse, Workspace, WorkspaceIdPayload, WorkspaceListPayload, WriteFileRequest, WsError,
 };
 
 /// Default loopback bind for the daemon. Mirrored by the existing

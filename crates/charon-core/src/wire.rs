@@ -125,6 +125,37 @@ pub enum ClientFrame {
     },
     #[serde(rename = "Diff.Get")]
     DiffGet { id: String, payload: DiffPayload },
+    #[serde(rename = "Terminal.Create")]
+    TerminalCreate {
+        id: String,
+        payload: CreateTerminalPayload,
+    },
+    #[serde(rename = "Terminal.SendKeys")]
+    TerminalSendKeys {
+        id: String,
+        payload: TerminalSendKeysPayload,
+    },
+    #[serde(rename = "Terminal.Resize")]
+    TerminalResize {
+        id: String,
+        payload: TerminalResizePayload,
+    },
+    #[serde(rename = "Terminal.Kill")]
+    TerminalKill {
+        id: String,
+        payload: TerminalIdPayload,
+    },
+    #[serde(rename = "Terminal.List")]
+    TerminalList {
+        id: String,
+        #[serde(default)]
+        payload: TerminalListPayload,
+    },
+    #[serde(rename = "Terminal.Scrollback")]
+    TerminalScrollback {
+        id: String,
+        payload: TerminalIdPayload,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +185,41 @@ pub enum ServerFrame {
     FileWritten { id: String, result: FileContent },
     #[serde(rename = "Diff.Snapshot")]
     DiffSnapshot { id: String, result: DiffResponse },
+    #[serde(rename = "Terminal.Created")]
+    TerminalCreated { id: String, result: Terminal },
+    #[serde(rename = "Terminal.KeysSent")]
+    TerminalKeysSent { id: String, result: TerminalKeysAck },
+    #[serde(rename = "Terminal.Resized")]
+    TerminalResized {
+        id: String,
+        result: TerminalResizeAck,
+    },
+    #[serde(rename = "Terminal.Killed")]
+    TerminalKilled { id: String, result: TerminalKillAck },
+    #[serde(rename = "Terminal.Listed")]
+    TerminalListed {
+        id: String,
+        result: TerminalListResponse,
+    },
+    #[serde(rename = "Terminal.ScrollbackSnapshot")]
+    TerminalScrollbackSnapshot {
+        id: String,
+        result: TerminalScrollbackResponse,
+    },
+    /// Server-pushed (no `id`): raw PTY output chunk, base64-encoded.
+    #[serde(rename = "Terminal.Output")]
+    TerminalOutput {
+        terminal_id: String,
+        data_b64: String,
+        seq: u64,
+    },
+    /// Server-pushed (no `id`): child process exited.
+    #[serde(rename = "Terminal.Exited")]
+    TerminalExited {
+        terminal_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        exit_code: Option<i32>,
+    },
     #[serde(rename = "Error")]
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -284,4 +350,102 @@ pub struct FileWritePayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiffPayload {
     pub workspace_id: String,
+}
+
+// ---------- terminal (M2.4) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Terminal {
+    pub id: String,
+    pub workspace_id: String,
+    pub command: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub status: TerminalStatus,
+    pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exited_at: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalStatus {
+    Running,
+    Exited,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalListResponse {
+    pub terminals: Vec<Terminal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalScrollbackResponse {
+    pub terminal_id: String,
+    /// base64-encoded raw PTY bytes (may include ANSI escapes / partial UTF-8).
+    pub data_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalKeysAck {
+    pub terminal_id: String,
+    pub bytes_written: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalResizeAck {
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalKillAck {
+    pub terminal_id: String,
+}
+
+// WS payloads (terminal)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTerminalPayload {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default = "default_cols")]
+    pub cols: u16,
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+}
+
+fn default_cols() -> u16 {
+    80
+}
+fn default_rows() -> u16 {
+    24
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalSendKeysPayload {
+    pub terminal_id: String,
+    /// base64-encoded raw bytes to write to the PTY's stdin.
+    pub data_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalResizePayload {
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalIdPayload {
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TerminalListPayload {
+    #[serde(default)]
+    pub workspace_id: Option<String>,
 }

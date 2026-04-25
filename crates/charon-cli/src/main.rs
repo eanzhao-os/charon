@@ -1,10 +1,14 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use charon_core::{
-    ClientFrame, DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER, DEFAULT_USER_SERVICE_SLUG,
-    HealthResponse, NyxIdentity, ServerFrame, WhoAmIResponse, WorkspaceListPayload,
+    ClientFrame, CreateTerminalPayload, CreateWorkspaceRequest, DEFAULT_DAEMON_BIND,
+    DEFAULT_NYXID_ISSUER, DEFAULT_USER_SERVICE_SLUG, HealthResponse, NyxIdentity, ServerFrame,
+    TerminalIdPayload, TerminalSendKeysPayload, WhoAmIResponse, WorkspaceIdPayload,
+    WorkspaceListPayload,
 };
 use charon_daemon::{DEFAULT_EXPECTED_AUD, DaemonConfig, default_home};
 use clap::{Parser, Subcommand};
@@ -46,6 +50,25 @@ enum Cmd {
         slug: String,
         #[arg(long, env = "CHARON_NYXID_BASE_URL", default_value = DEFAULT_NYXID_ISSUER)]
         base_url: String,
+    },
+    /// WebSocket diagnostics.
+    Ws {
+        #[command(subcommand)]
+        sub: WsCmd,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum WsCmd {
+    /// End-to-end terminal smoke: create workspace + terminal, run `echo`, verify output.
+    ProbeTerminal {
+        #[arg(long, env = "CHARON_NYXID_BASE_URL", default_value = DEFAULT_NYXID_ISSUER)]
+        base_url: String,
+        #[arg(long, env = "CHARON_DOCTOR_SLUG", default_value = DEFAULT_USER_SERVICE_SLUG)]
+        slug: String,
+        /// Project root for the throwaway workspace (auto git-init'd if needed).
+        #[arg(long, default_value = "/tmp/charon-probe")]
+        project_root: PathBuf,
     },
 }
 
@@ -92,6 +115,14 @@ async fn main() -> Result<()> {
             slug,
             base_url,
         } => doctor(&endpoint, &slug, &base_url).await,
+        Cmd::Ws {
+            sub:
+                WsCmd::ProbeTerminal {
+                    base_url,
+                    slug,
+                    project_root,
+                },
+        } => probe_terminal(&base_url, &slug, &project_root).await,
     }
 }
 
@@ -289,16 +320,265 @@ async fn recv_server_frame<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let msg = socket
-        .next()
+    loop {
+        let msg = socket
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("WS closed before frame received"))?
+            .context("WS recv")?;
+        match msg {
+            TungsteniteMessage::Text(text) => {
+                return serde_json::from_str(text.as_str())
+                    .with_context(|| format!("parse server frame: {text}"));
+            }
+            TungsteniteMessage::Ping(p) => {
+                let _ = socket.send(TungsteniteMessage::Pong(p)).await;
+            }
+            TungsteniteMessage::Pong(_) => {}
+            TungsteniteMessage::Close(_) => bail!("WS closed during recv"),
+            TungsteniteMessage::Binary(_) | TungsteniteMessage::Frame(_) => continue,
+        }
+    }
+}
+
+async fn send_client_frame<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    frame: &ClientFrame,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let text = serde_json::to_string(frame).context("serialize client frame")?;
+    socket
+        .send(TungsteniteMessage::Text(text.into()))
         .await
-        .ok_or_else(|| anyhow!("WS closed before frame received"))?
-        .context("WS recv")?;
-    let text = match msg {
-        TungsteniteMessage::Text(t) => t,
-        other => bail!("expected text frame, got {other:?}"),
+        .context("WS send")?;
+    Ok(())
+}
+
+async fn ensure_git_repo(path: &Path) -> Result<()> {
+    if !path.exists() {
+        std::fs::create_dir_all(path).with_context(|| format!("mkdir {}", path.display()))?;
+    }
+    let probe = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .context("exec `git rev-parse`")?;
+    if probe.status.success() {
+        return Ok(());
+    }
+    let init = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["init", "-q", "-b", "main"])
+        .output()
+        .context("exec `git init`")?;
+    if !init.status.success() {
+        bail!(
+            "git init failed: {}",
+            String::from_utf8_lossy(&init.stderr).trim()
+        );
+    }
+    let commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "-c",
+            "user.email=probe@charon",
+            "-c",
+            "user.name=probe",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "init",
+        ])
+        .output()
+        .context("exec `git commit`")?;
+    if !commit.status.success() {
+        bail!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+async fn probe_terminal(base_url: &str, slug: &str, project_root: &Path) -> Result<()> {
+    println!("== charon ws probe-terminal ==\n");
+
+    ensure_git_repo(project_root)
+        .await
+        .with_context(|| format!("ensure {} is a git repo", project_root.display()))?;
+    println!("[1] project_root {} ready", project_root.display());
+
+    let token = read_nyxid_token().context("read NyxID access token")?;
+    let ws_url = build_ws_url(base_url, slug);
+    let mut req = ws_url
+        .as_str()
+        .into_client_request()
+        .with_context(|| format!("invalid ws url {ws_url}"))?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}")
+            .parse()
+            .context("Bearer header parse")?,
+    );
+    let (mut socket, _) = connect_async(req)
+        .await
+        .with_context(|| format!("WS connect {ws_url}"))?;
+    println!("[2] WS connected to {ws_url}");
+
+    let identity = match recv_server_frame(&mut socket).await? {
+        ServerFrame::Hello { payload } => payload.identity,
+        other => bail!("expected Hello, got {other:?}"),
     };
-    serde_json::from_str(text.as_str()).with_context(|| format!("parse server frame: {text}"))
+    println!("[3] Hello user_id={}", identity.user_id);
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::WorkspaceCreate {
+            id: "probe-ws-create".into(),
+            payload: CreateWorkspaceRequest {
+                project_root: project_root.to_path_buf(),
+                title: Some("probe-terminal".into()),
+                base_branch: None,
+                new_branch: None,
+            },
+        },
+    )
+    .await?;
+    let workspace = loop {
+        match recv_server_frame(&mut socket).await? {
+            ServerFrame::WorkspaceCreated { result, .. } => break result,
+            ServerFrame::Error { error, .. } => {
+                bail!("WorkspaceCreate failed: {} {}", error.code, error.message);
+            }
+            _ => continue,
+        }
+    };
+    println!(
+        "[4] Workspace.Created id={} branch={}",
+        workspace.id, workspace.branch
+    );
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TerminalCreate {
+            id: "probe-term-create".into(),
+            payload: CreateTerminalPayload {
+                workspace_id: workspace.id.clone(),
+                command: Some("/bin/sh".into()),
+                cols: 80,
+                rows: 24,
+            },
+        },
+    )
+    .await?;
+    let terminal = loop {
+        match recv_server_frame(&mut socket).await? {
+            ServerFrame::TerminalCreated { result, .. } => break result,
+            ServerFrame::Error { error, .. } => {
+                bail!("TerminalCreate failed: {} {}", error.code, error.message);
+            }
+            _ => continue,
+        }
+    };
+    println!("[5] Terminal.Created id={}", terminal.id);
+
+    let cmd = "echo M24_SMOKE_OK; exit\n";
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::TerminalSendKeys {
+            id: "probe-term-keys".into(),
+            payload: TerminalSendKeysPayload {
+                terminal_id: terminal.id.clone(),
+                data_b64: BASE64.encode(cmd.as_bytes()),
+            },
+        },
+    )
+    .await?;
+    println!("[6] sent {} bytes to PTY stdin", cmd.len());
+
+    let mut accumulated: Vec<u8> = Vec::new();
+    let mut saw_magic = false;
+    let mut exited_code: Option<Option<i32>> = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while exited_code.is_none() && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let frame = match tokio::time::timeout(remaining, recv_server_frame(&mut socket)).await {
+            Ok(Ok(f)) => f,
+            Ok(Err(e)) => return Err(e.context("recv during terminal output")),
+            Err(_) => break,
+        };
+        match frame {
+            ServerFrame::TerminalOutput {
+                terminal_id,
+                data_b64,
+                ..
+            } if terminal_id == terminal.id => {
+                let bytes = BASE64
+                    .decode(data_b64.as_bytes())
+                    .context("decode output")?;
+                accumulated.extend_from_slice(&bytes);
+                if !saw_magic && String::from_utf8_lossy(&accumulated).contains("M24_SMOKE_OK") {
+                    saw_magic = true;
+                    println!("[7] saw M24_SMOKE_OK in PTY output");
+                }
+            }
+            ServerFrame::TerminalExited {
+                terminal_id,
+                exit_code,
+            } if terminal_id == terminal.id => {
+                exited_code = Some(exit_code);
+                println!("[8] Terminal.Exited exit_code={:?}", exit_code);
+            }
+            ServerFrame::Error { error, .. } => {
+                bail!("WS error during stream: {} {}", error.code, error.message);
+            }
+            _ => {}
+        }
+    }
+
+    if !saw_magic {
+        bail!(
+            "never saw M24_SMOKE_OK in {} bytes of output",
+            accumulated.len()
+        );
+    }
+    if exited_code.is_none() {
+        send_client_frame(
+            &mut socket,
+            &ClientFrame::TerminalKill {
+                id: "probe-term-kill".into(),
+                payload: TerminalIdPayload {
+                    terminal_id: terminal.id.clone(),
+                },
+            },
+        )
+        .await?;
+        println!("(timeout: sent Terminal.Kill as fallback)");
+    }
+
+    send_client_frame(
+        &mut socket,
+        &ClientFrame::WorkspaceArchive {
+            id: "probe-ws-archive".into(),
+            payload: WorkspaceIdPayload {
+                workspace_id: workspace.id.clone(),
+            },
+        },
+    )
+    .await?;
+    // best-effort: drain a frame so the daemon log isn't surprised
+    let _ = tokio::time::timeout(Duration::from_secs(2), recv_server_frame(&mut socket)).await;
+    println!("[9] workspace archived (cleanup)");
+
+    let _ = socket.close(None).await;
+    println!("\nAll probe-terminal checks passed.");
+    Ok(())
 }
 
 async fn local_health(endpoint: &str) -> Result<String> {

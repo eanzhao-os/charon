@@ -13,7 +13,7 @@
 | **M2.1 Workspace 模型** | git worktree manager（shell-out 到 `git`）、`~/.charon/workspaces.json` 持久化、`POST/GET /api/v1/workspaces`、`POST /api/v1/workspaces/:id/archive`，全部走 `IdentityToken` | M1 | ✅ 2026-04-25 |
 | **M2.2 WS 协议** | `GET /api/v1/ws` 升级（JWT at upgrade only）；JSON envelope；帧命名空间起步 `Workspace.*`；60s 服务端 Ping；Hello 帧带 identity；Error 帧带原 request id；二进制 attachment 留给 M2.3/M2.4 真用得着再做 | M2.1 | ✅ 2026-04-25 |
 | **M2.3 File / Diff API** | 路径 sandbox（lexical `safe_join`，拒 `../` + 绝对路径）；`File.{List,Read,Write}` REST + WS（UTF-8 only，binary 留 M2.4）；`Diff.Get` shell-out `git diff` + `ls-files --others`，per-file unified diff | M2.2 | ✅ 2026-04-26 |
-| **M2.4 Terminal** | `pty-process` 起 shell；scrollback 16K 行 ring buffer；resize / 特殊键 / 颜色保留；多 terminal/workspace | M2.2 | ⏳ |
+| **M2.4 Terminal** | `portable-pty` 起 shell；scrollback 1 MiB ring buffer；resize / kill / list / scrollback；server→client `Terminal.Output` 广播（base64-in-JSON）；`charon ws probe-terminal` 端到端 smoke | M2.2 | ✅ 2026-04-26 |
 | **M2.5 Tauri desktop shell** | `crates/charon-desktop`：Tauri v2 + React 19 + TanStack + Tailwind 4；NyxID OAuth in webview → UserService 发现 → WS 连接；workspace 树 / diff 视图 / xterm.js terminal | M2.2-M2.4 | ⏳ |
 | **M2.6 `charon link` + 配置收尾** | 自动化 `nyxid node register` + `nyxid service add`，把 slug/credential 写到 `~/.charon/config.toml`；`charon doctor` 改读 config 而不是 `DEFAULT_USER_SERVICE_SLUG` | 任意时机 | ⏳ |
 
@@ -151,6 +151,53 @@ JWT 验签发生在 `IdentityToken` extractor，axum 的 `WebSocketUpgrade` 也�
   "untracked": ["src/util.rs"]
 }
 ```
+
+## M2.4 实施进度（live log）
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| Terminal wire 类型 | ✅ | `Terminal` / `TerminalStatus` / `TerminalListResponse` / `TerminalScrollbackResponse` / `TerminalKeysAck` / `TerminalResizeAck` / `TerminalKillAck` + 5 个 WS payload；`ClientFrame` +6（Create/SendKeys/Resize/Kill/List/Scrollback）、`ServerFrame` +8（6 个 ack + 2 个 server-pushed Output/Exited） |
+| `charon-daemon::terminal` | ✅ | `TerminalManager` 用 `tokio::sync::broadcast` 全局广播 `TerminalEvent`；每 PTY 一个 blocking 线程 drain reader → scrollback ring (1 MiB) + broadcast；写 / resize / kill 走 `tokio::task::spawn_blocking`；child waiter 单线程 mark Exited 并广播 |
+| AppState + WS 接线 | ✅ | `AppState.terminals: Arc<TerminalManager>` 加进 `FromRef`；`run_session` 多一个 `terminal_events.recv()` 分支，Lagged 时 warn 并提示重拉 scrollback |
+| WS dispatch 6 个 client frame | ✅ | `Terminal.Create` 拉 workspace + 起 PTY；`SendKeys` base64-decode 后写；`Resize/Kill/List/Scrollback` 直调 manager |
+| `charon ws probe-terminal` CLI | ✅ | 自动 git-init `/tmp/charon-probe`、Hello → Workspace.Create → Terminal.Create → SendKeys "echo M24_SMOKE_OK; exit\n" → 等 Output 含 magic + Exited → 清理 archive |
+| 端到端实测 | ✅ | 见下文 |
+
+### M2.4 端到端实测（2026-04-26）
+
+```
+== charon ws probe-terminal ==
+
+[1] project_root /tmp/charon-probe ready
+[2] WS connected to wss://nyx-api.chrono-ai.fun/api/v1/proxy/s/charon-echo-poc/api/v1/ws
+[3] Hello user_id=5d0d7b72-...
+[4] Workspace.Created id=ae9f02a4-... branch=charon/ae9f02a4
+[5] Terminal.Created id=96c68b4c-...
+[6] sent 24 bytes to PTY stdin
+[7] saw M24_SMOKE_OK in PTY output
+[8] Terminal.Exited exit_code=Some(0)
+[9] workspace archived (cleanup)
+
+All probe-terminal checks passed.
+```
+
+Daemon 端日志：
+```
+INFO charon_daemon::ws: WS upgrade user_id=...
+INFO charon_daemon::workspace: workspace created id=ae9f02a4-...
+INFO charon_daemon::terminal: terminal spawned id=96c68b4c-... command=/bin/sh cols=80 rows=24
+DEBUG charon_daemon::terminal: PTY EOF; reader exiting
+INFO charon_daemon::terminal: terminal exited exit_code=Some(0)
+INFO charon_daemon::workspace: workspace archived id=ae9f02a4-...
+DEBUG charon_daemon::ws: WS close from client
+```
+
+### M2.4 偏差
+
+- **没用 36B UUID 前缀的 binary attachment**：terminal output 直接 base64 in JSON。理由：典型 PTY chunk <1KB，base64 33% 开销 < 双帧（envelope + binary）开销；自包含帧好调试。等 M3 真有大 blob（文件 upload）再加 binary attachment 协议。
+- **Terminal subscriptions 不做**：所有 WS session 收所有 terminal 事件，client 自己按 terminal_id filter。简单，单用户场景够。多用户/多 client 真排队再考虑 explicit Subscribe / Unsubscribe。
+- **没 GC**：`Exited` 后 handle 留在 manager，方便事后查 scrollback。daemon 重启清空。等真撑爆内存再加 retention。
+- **continue 语句而不是 if-let-else**：每个 dispatch arm 自己手写 match-fetch-workspace-or-error，没抽 helper。9 个 arm 共有这个 pattern；后续重构时再合并。
 
 ### M2.3 偏差
 

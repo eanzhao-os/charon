@@ -12,14 +12,17 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use charon_core::{
     ClientFrame, DAEMON_VERSION, HelloPayload, ListWorkspacesResponse, NyxIdentity, ServerFrame,
-    ServerInfo, WsError,
+    ServerInfo, TerminalKeysAck, TerminalKillAck, TerminalResizeAck, WsError,
 };
 use chrono::Utc;
+use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
 use crate::nyxid_jwt::IdentityToken;
+use crate::terminal::{TerminalEvent, TerminalManager};
 use crate::workspace::WorkspaceManager;
 use crate::{AppState, diff, files};
 
@@ -56,16 +59,18 @@ async fn run_session(mut socket: WebSocket, state: AppState, identity: NyxIdenti
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await; // skip the immediate tick
 
+    let mut terminal_events = state.terminals.subscribe();
+
     loop {
         tokio::select! {
             msg = socket.recv() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        dispatch(&mut socket, &state.workspaces, text.as_str()).await;
+                        dispatch(&mut socket, &state.workspaces, &state.terminals, text.as_str()).await;
                     }
                     Some(Ok(Message::Binary(_))) => {
                         send_error(&mut socket, None, "unsupported_binary",
-                            "binary frames land in M2.3/M2.4").await;
+                            "client→server binary frames not used in M2.4 (terminal output uses base64-in-JSON)").await;
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         let _ = socket.send(Message::Pong(payload)).await;
@@ -81,6 +86,32 @@ async fn run_session(mut socket: WebSocket, state: AppState, identity: NyxIdenti
                     }
                 }
             }
+            event = terminal_events.recv() => {
+                match event {
+                    Ok(TerminalEvent::Output { terminal_id, data, seq }) => {
+                        let frame = ServerFrame::TerminalOutput {
+                            terminal_id,
+                            data_b64: BASE64.encode(&data),
+                            seq,
+                        };
+                        send_or_warn(&mut socket, &frame).await;
+                    }
+                    Ok(TerminalEvent::Exited { terminal_id, exit_code }) => {
+                        send_or_warn(
+                            &mut socket,
+                            &ServerFrame::TerminalExited { terminal_id, exit_code },
+                        )
+                        .await;
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!(missed = n, "WS session lagged on terminal events; client should refetch scrollback");
+                    }
+                    Err(RecvError::Closed) => {
+                        debug!("terminal broadcast closed; ending session");
+                        return;
+                    }
+                }
+            }
             _ = heartbeat.tick() => {
                 if let Err(e) = socket.send(Message::Ping(vec![].into())).await {
                     warn!(error = %e, "ping send failed; closing");
@@ -91,7 +122,12 @@ async fn run_session(mut socket: WebSocket, state: AppState, identity: NyxIdenti
     }
 }
 
-async fn dispatch(socket: &mut WebSocket, workspaces: &Arc<WorkspaceManager>, text: &str) {
+async fn dispatch(
+    socket: &mut WebSocket,
+    workspaces: &Arc<WorkspaceManager>,
+    terminals: &Arc<TerminalManager>,
+    text: &str,
+) {
     let frame: ClientFrame = match serde_json::from_str(text) {
         Ok(f) => f,
         Err(e) => {
@@ -224,6 +260,111 @@ async fn dispatch(socket: &mut WebSocket, workspaces: &Arc<WorkspaceManager>, te
                     send_or_warn(socket, &ServerFrame::DiffSnapshot { id, result }).await;
                 }
                 Err(e) => send_error(socket, Some(id), "diff_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::TerminalCreate { id, payload } => {
+            let ws = match workspaces.get(&payload.workspace_id).await {
+                Some(ws) => ws,
+                None => {
+                    send_error(
+                        socket,
+                        Some(id),
+                        "not_found",
+                        format!("workspace {} not found", payload.workspace_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match terminals.create(&ws, payload).await {
+                Ok(result) => {
+                    send_or_warn(socket, &ServerFrame::TerminalCreated { id, result }).await;
+                }
+                Err(e) => {
+                    send_error(socket, Some(id), "terminal_create_failed", e.to_string()).await
+                }
+            }
+        }
+        ClientFrame::TerminalSendKeys { id, payload } => {
+            let bytes = match BASE64.decode(payload.data_b64.as_bytes()) {
+                Ok(b) => b,
+                Err(e) => {
+                    send_error(socket, Some(id), "bad_base64", e.to_string()).await;
+                    return;
+                }
+            };
+            match terminals.send_keys(&payload.terminal_id, bytes).await {
+                Ok(bytes_written) => {
+                    send_or_warn(
+                        socket,
+                        &ServerFrame::TerminalKeysSent {
+                            id,
+                            result: TerminalKeysAck {
+                                terminal_id: payload.terminal_id,
+                                bytes_written,
+                            },
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(socket, Some(id), "send_keys_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::TerminalResize { id, payload } => {
+            match terminals
+                .resize(&payload.terminal_id, payload.cols, payload.rows)
+                .await
+            {
+                Ok(()) => {
+                    send_or_warn(
+                        socket,
+                        &ServerFrame::TerminalResized {
+                            id,
+                            result: TerminalResizeAck {
+                                terminal_id: payload.terminal_id,
+                                cols: payload.cols,
+                                rows: payload.rows,
+                            },
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(socket, Some(id), "resize_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::TerminalKill { id, payload } => {
+            match terminals.kill(&payload.terminal_id).await {
+                Ok(()) => {
+                    send_or_warn(
+                        socket,
+                        &ServerFrame::TerminalKilled {
+                            id,
+                            result: TerminalKillAck {
+                                terminal_id: payload.terminal_id,
+                            },
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(socket, Some(id), "kill_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::TerminalList { id, payload } => {
+            let result = terminals
+                .list_response(payload.workspace_id.as_deref())
+                .await;
+            send_or_warn(socket, &ServerFrame::TerminalListed { id, result }).await;
+        }
+        ClientFrame::TerminalScrollback { id, payload } => {
+            match terminals.scrollback(&payload.terminal_id).await {
+                Ok(result) => {
+                    send_or_warn(
+                        socket,
+                        &ServerFrame::TerminalScrollbackSnapshot { id, result },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(socket, Some(id), "scrollback_failed", e.to_string()).await,
             }
         }
     }

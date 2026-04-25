@@ -47,6 +47,9 @@ thiserror = "2"
 futures = "0.3.31"
 directories = "6"
 tempfile = "3"
+base64 = "0.22"
+bytes = "1"
+portable-pty = "0.9"
 
 [profile.release]
 lto = "thin"

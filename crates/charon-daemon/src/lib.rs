@@ -6,6 +6,7 @@
 pub mod diff;
 pub mod files;
 pub mod nyxid_jwt;
+pub mod terminal;
 pub mod workspace;
 pub mod ws;
 
@@ -30,6 +31,7 @@ use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::nyxid_jwt::{IdentityToken, JwksClient};
+use crate::terminal::TerminalManager;
 use crate::workspace::WorkspaceManager;
 
 /// Default `aud` for the existing `charon-echo-poc` UserService — its
@@ -80,6 +82,7 @@ pub fn default_home() -> Result<PathBuf> {
 pub struct AppState {
     pub jwks: Arc<JwksClient>,
     pub workspaces: Arc<WorkspaceManager>,
+    pub terminals: Arc<TerminalManager>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,7 +140,12 @@ pub async fn serve(config: DaemonConfig, shutdown: Option<CancellationToken>) ->
             .await
             .context("initialize WorkspaceManager")?,
     );
-    let state = AppState { jwks, workspaces };
+    let terminals = Arc::new(TerminalManager::new());
+    let state = AppState {
+        jwks,
+        workspaces,
+        terminals,
+    };
 
     let listener = TcpListener::bind(config.bind)
         .await
