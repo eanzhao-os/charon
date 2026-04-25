@@ -1,0 +1,52 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.93"
+license = "Apache-2.0"
+repository = "https://github.com/eanzhao/charon"
+
+[workspace.dependencies]
+# internal crates
+charon-core = { path = "crates/charon-core" }
+charon-daemon = { path = "crates/charon-daemon" }
+
+# async runtime + http
+tokio = { version = "1.51", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+axum = { version = "0.8.8", features = ["macros", "ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# serde / data
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+chrono = { version = "0.4.43", features = ["serde"] }
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# logging
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# JWT
+jsonwebtoken = "9"
+
+# errors
+anyhow = "1"
+thiserror = "2"
+
+# misc
+futures = "0.3.31"
+directories = "6"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
