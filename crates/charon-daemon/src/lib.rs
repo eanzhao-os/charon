@@ -5,6 +5,7 @@
 
 pub mod nyxid_jwt;
 pub mod workspace;
+pub mod ws;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use charon_core::{
     CreateWorkspaceRequest, DAEMON_VERSION, DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER,
-    HealthResponse, ListWorkspacesResponse, WhoAmIResponse, Workspace,
+    HealthResponse, ListWorkspacesResponse, WS_PATH, WhoAmIResponse, Workspace,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -111,6 +112,7 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/workspaces/{id}/archive",
             post(archive_workspace_handler),
         )
+        .route(WS_PATH, get(ws::ws_upgrade_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

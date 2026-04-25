@@ -21,6 +21,7 @@ axum = { version = "0.8.8", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots", "url"] }
 
 # serde / data
 serde = { version = "1.0.228", features = ["derive"] }

@@ -11,7 +11,7 @@
 | 子里程碑 | 范围 | 依赖 | 状态 |
 |---|---|---|---|
 | **M2.1 Workspace 模型** | git worktree manager（shell-out 到 `git`）、`~/.charon/workspaces.json` 持久化、`POST/GET /api/v1/workspaces`、`POST /api/v1/workspaces/:id/archive`，全部走 `IdentityToken` | M1 | ✅ 2026-04-25 |
-| **M2.2 WS 协议** | `GET /api/v1/ws` 升级；JSON envelope + 36B UUID 前缀 binary attachment（参考 NyxID node frame）；帧命名空间 `Workspace.* / File.* / Diff.* / Terminal.*`；60s ping 避开 NyxID 300s idle | M2.1 | ⏳ |
+| **M2.2 WS 协议** | `GET /api/v1/ws` 升级（JWT at upgrade only）；JSON envelope；帧命名空间起步 `Workspace.*`；60s 服务端 Ping；Hello 帧带 identity；Error 帧带原 request id；二进制 attachment 留给 M2.3/M2.4 真用得着再做 | M2.1 | ✅ 2026-04-25 |
 | **M2.3 File / Diff API** | 路径校验严格在 worktree 内（`canonicalize` 前缀 check）；`gix` 算 working-tree vs base diff，按文件分块；`notify` 监听变化；大文件 (>1MB) 分片帧 | M2.2 | ⏳ |
 | **M2.4 Terminal** | `pty-process` 起 shell；scrollback 16K 行 ring buffer；resize / 特殊键 / 颜色保留；多 terminal/workspace | M2.2 | ⏳ |
 | **M2.5 Tauri desktop shell** | `crates/charon-desktop`：Tauri v2 + React 19 + TanStack + Tailwind 4；NyxID OAuth in webview → UserService 发现 → WS 连接；workspace 树 / diff 视图 / xterm.js terminal | M2.2-M2.4 | ⏳ |
@@ -50,6 +50,62 @@
 | 新增 env | ✅ | `CHARON_HOME`，默认 `$HOME/.charon` |
 | 单测（charon-daemon） | ✅ | `create_list_get_archive_roundtrip` / `rejects_relative_project_root` / `rejects_non_git_dir`，3 个全过 |
 | 端到端经 NyxID proxy | ✅ | create (201) → list active (1) → get (200) → archive (200) → list active (0) → list include_archived (1) → re-archive idempotent (同 archived_at) → 错误路径 401/404/400 全对 |
+
+## M2.2 实施进度（live log）
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| Frame wire 类型 | ✅ | `charon-core::wire`：`ClientFrame` (4 个)、`ServerFrame` (6 个)、`HelloPayload`、`ServerInfo`、`WsError`、`WorkspaceListPayload`、`WorkspaceIdPayload`；`WS_PATH = "/api/v1/ws"` 常量 |
+| Daemon WS handler | ✅ | `charon-daemon::ws::ws_upgrade_handler`；`IdentityToken` extractor 在 upgrade 之前跑（401 if missing）；`run_session` 推 Hello → loop dispatch + 60s server Ping |
+| Frame 分发 | ✅ | `Workspace.{List,Create,Get,Archive}` 4 个全实现，复用 `WorkspaceManager` 业务逻辑；malformed frame → `Error` (id=null, code=`malformed_frame`)；二进制帧 → `Error (unsupported_binary)` 但保连接 |
+| Doctor [4] | ✅ | 改用 wss schema 拼 URL；连接 → 收 Hello → 发 Workspace.List → 收 Workspace.Listed (id 校验) → close；Hello identity 与 [3] HTTP /whoami 比对，"matches /whoami" 标注 |
+| 端到端实测 | ✅ | 见下文 |
+
+### M2.2 端到端实测（2026-04-25）
+
+`charon doctor` 完整输出：
+
+```
+== charon doctor ==
+
+[1] local charon-daemon at http://127.0.0.1:18789
+  ✓ charon-daemon 0.0.1
+[2] nyxid node daemon
+  ✓ running (PID 69251)
+[3] end-to-end /whoami via NyxID proxy
+    GET https://nyx-api.chrono-ai.fun/api/v1/proxy/s/charon-echo-poc/api/v1/whoami
+  ✓ user_id=5d0d7b72-... email=eancuznaivy@gmail.com
+[4] WS handshake via NyxID proxy
+    wss://nyx-api.chrono-ai.fun/api/v1/proxy/s/charon-echo-poc/api/v1/ws
+  ✓ Hello received: user_id=5d0d7b72-... (matches /whoami)
+
+All checks passed.
+```
+
+Daemon 端日志：
+
+```
+INFO charon_daemon::ws: WS upgrade user_id=5d0d7b72-...
+DEBUG charon_daemon::ws: WS close from client
+```
+
+WS 鉴权 sanity（直连无 JWT）：
+
+```bash
+curl -i -H "Connection: Upgrade" -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  http://127.0.0.1:18789/api/v1/ws
+# HTTP/1.1 401 Unauthorized
+# {"error":"missing_identity_token","message":"missing X-NyxID-Identity-Token header"}
+```
+
+JWT 验签发生在 `IdentityToken` extractor，axum 的 `WebSocketUpgrade` 也是 `FromRequestParts`，二者按 handler 签名顺序串起来执行 → upgrade 之前就被挡掉。
+
+### 跟原计划的偏差
+
+- **二进制 attachment 36B UUID 前缀延后**：M2.2 没用例（终端输出 / 文件 blob 都是 M2.3/M2.4 的事），所以协议帧里没有 `binary_attachment_ref` 字段。等到 M2.3 加 `Diff.Blob` / M2.4 加 `Terminal.Output` 时一起补，wire 类型 enum 加变体即可向后兼容。
+- **应用层 Ping/Pong 不做**：直接用 WebSocket 协议级 Ping（每 60s 服务器主动发），客户端 / NyxID node 自动回 Pong，不污染 JSON envelope。
+- **没起 `charon ws probe` 子命令**：直接把 WS 探测塞进 `doctor` 第 4 步，避免新命令 + 重复实现。等 desktop client 上来了再考虑独立的 `charon ws connect` REPL。
 
 ### M2.1 端到端实测（2026-04-25）
 

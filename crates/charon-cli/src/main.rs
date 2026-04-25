@@ -3,11 +3,16 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use charon_core::{
-    DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER, DEFAULT_USER_SERVICE_SLUG, HealthResponse,
-    NyxIdentity, WhoAmIResponse,
+    ClientFrame, DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER, DEFAULT_USER_SERVICE_SLUG,
+    HealthResponse, NyxIdentity, ServerFrame, WhoAmIResponse, WorkspaceListPayload,
 };
 use charon_daemon::{DEFAULT_EXPECTED_AUD, DaemonConfig, default_home};
 use clap::{Parser, Subcommand};
+use futures::sink::SinkExt;
+use futures::stream::StreamExt;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -162,9 +167,9 @@ async fn doctor(local_endpoint: &str, slug: &str, base_url: &str) -> Result<()> 
         base_url.trim_end_matches('/'),
         slug
     );
-    println!("[3] end-to-end via NyxID proxy");
+    println!("[3] end-to-end /whoami via NyxID proxy");
     println!("    GET {proxy_url}");
-    match e2e_whoami(&proxy_url).await {
+    let http_identity = match e2e_whoami(&proxy_url).await {
         Ok(identity) => {
             println!(
                 "  ✓ user_id={} email={}",
@@ -178,10 +183,33 @@ async fn doctor(local_endpoint: &str, slug: &str, base_url: &str) -> Result<()> 
                 identity.groups.len(),
                 identity.expires_at
             );
+            Some(identity)
         }
         Err(e) => {
             println!("  ✗ {e:#}\n");
             failures.push("end-to-end");
+            None
+        }
+    };
+
+    let ws_url = build_ws_url(base_url, slug);
+    println!("[4] WS handshake via NyxID proxy");
+    println!("    {ws_url}");
+    match ws_handshake_probe(&ws_url).await {
+        Ok(ws_identity) => {
+            let suffix = match &http_identity {
+                Some(http) if http.user_id == ws_identity.user_id => " (matches /whoami)",
+                Some(_) => " (DIFFERENT user_id from /whoami!)",
+                None => "",
+            };
+            println!(
+                "  ✓ Hello received: user_id={}{}\n",
+                ws_identity.user_id, suffix
+            );
+        }
+        Err(e) => {
+            println!("  ✗ {e:#}\n");
+            failures.push("ws-handshake");
         }
     }
 
@@ -195,6 +223,82 @@ async fn doctor(local_endpoint: &str, slug: &str, base_url: &str) -> Result<()> 
             failures.join(", ")
         )
     }
+}
+
+fn build_ws_url(base_url: &str, slug: &str) -> String {
+    let trimmed = base_url.trim_end_matches('/');
+    let scheme_swapped = if let Some(rest) = trimmed.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = trimmed.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        trimmed.to_string()
+    };
+    format!("{scheme_swapped}/api/v1/proxy/s/{slug}/api/v1/ws")
+}
+
+async fn ws_handshake_probe(ws_url: &str) -> Result<NyxIdentity> {
+    let token = read_nyxid_token().context("read NyxID access token")?;
+    let mut req = ws_url
+        .into_client_request()
+        .with_context(|| format!("invalid ws url {ws_url}"))?;
+    req.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {token}")
+            .parse()
+            .context("Bearer header parse")?,
+    );
+    let (mut socket, _resp) = connect_async(req)
+        .await
+        .with_context(|| format!("WS connect {ws_url}"))?;
+
+    // 1. Hello (server-pushed on connect).
+    let identity = match recv_server_frame(&mut socket).await? {
+        ServerFrame::Hello { payload } => payload.identity,
+        other => bail!("expected Hello, got {other:?}"),
+    };
+
+    // 2. Round-trip Workspace.List ↔ Workspace.Listed.
+    let req_id = "charon-doctor-probe".to_string();
+    let req_frame = ClientFrame::WorkspaceList {
+        id: req_id.clone(),
+        payload: WorkspaceListPayload {
+            include_archived: true,
+        },
+    };
+    let req_text = serde_json::to_string(&req_frame).context("serialize Workspace.List")?;
+    socket
+        .send(TungsteniteMessage::Text(req_text.into()))
+        .await
+        .context("send Workspace.List")?;
+    match recv_server_frame(&mut socket).await? {
+        ServerFrame::WorkspaceListed { id, .. } if id == req_id => {}
+        ServerFrame::WorkspaceListed { id, .. } => {
+            bail!("Workspace.Listed id mismatch: sent {req_id}, got {id}");
+        }
+        other => bail!("expected Workspace.Listed, got {other:?}"),
+    }
+
+    let _ = socket.close(None).await;
+    Ok(identity)
+}
+
+async fn recv_server_frame<S>(
+    socket: &mut tokio_tungstenite::WebSocketStream<S>,
+) -> Result<ServerFrame>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let msg = socket
+        .next()
+        .await
+        .ok_or_else(|| anyhow!("WS closed before frame received"))?
+        .context("WS recv")?;
+    let text = match msg {
+        TungsteniteMessage::Text(t) => t,
+        other => bail!("expected text frame, got {other:?}"),
+    };
+    serde_json::from_str(text.as_str()).with_context(|| format!("parse server frame: {text}"))
 }
 
 async fn local_health(endpoint: &str) -> Result<String> {

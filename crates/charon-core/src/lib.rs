@@ -6,8 +6,9 @@
 pub mod wire;
 
 pub use wire::{
-    CreateWorkspaceRequest, HealthResponse, ListWorkspacesResponse, NyxIdentity, WhoAmIResponse,
-    Workspace,
+    ClientFrame, CreateWorkspaceRequest, HealthResponse, HelloPayload, ListWorkspacesResponse,
+    NyxIdentity, ServerFrame, ServerInfo, WhoAmIResponse, Workspace, WorkspaceIdPayload,
+    WorkspaceListPayload, WsError,
 };
 
 /// Default loopback bind for the daemon. Mirrored by the existing
@@ -29,3 +30,6 @@ pub const IDENTITY_TOKEN_HEADER: &str = "X-NyxID-Identity-Token";
 /// link` lands (M2) and writes a per-host config, `doctor` should read the slug
 /// from there instead.
 pub const DEFAULT_USER_SERVICE_SLUG: &str = "charon-echo-poc";
+
+/// HTTP path the daemon exposes its WebSocket upgrade on.
+pub const WS_PATH: &str = "/api/v1/ws";
