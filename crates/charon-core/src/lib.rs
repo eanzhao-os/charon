@@ -5,7 +5,10 @@
 
 pub mod wire;
 
-pub use wire::{HealthResponse, NyxIdentity, WhoAmIResponse};
+pub use wire::{
+    CreateWorkspaceRequest, HealthResponse, ListWorkspacesResponse, NyxIdentity, WhoAmIResponse,
+    Workspace,
+};
 
 /// Default loopback bind for the daemon. Mirrored by the existing
 /// `charon-echo-poc` UserService endpoint URL.

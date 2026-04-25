@@ -31,8 +31,13 @@ chrono.workspace = true
 
 jsonwebtoken.workspace = true
 
+uuid.workspace = true
+
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

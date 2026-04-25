@@ -19,7 +19,7 @@ use charon_core::{IDENTITY_TOKEN_HEADER, NyxIdentity};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -237,12 +237,6 @@ fn claims_to_identity(raw: RawClaims) -> NyxIdentity {
 
 // ----- axum extractor -----
 
-#[derive(Debug, Serialize)]
-pub struct ErrorBody {
-    pub error: &'static str,
-    pub message: String,
-}
-
 pub struct IdentityToken(pub NyxIdentity);
 
 impl<S> FromRequestParts<S> for IdentityToken
@@ -250,7 +244,7 @@ where
     S: Send + Sync,
     Arc<JwksClient>: FromRef<S>,
 {
-    type Rejection = (StatusCode, Json<ErrorBody>);
+    type Rejection = (StatusCode, Json<crate::ErrorBody>);
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let raw = parts.headers.get(IDENTITY_TOKEN_HEADER).ok_or_else(|| {
@@ -284,11 +278,15 @@ where
     }
 }
 
-fn reject(status: StatusCode, code: &'static str, err: JwtError) -> (StatusCode, Json<ErrorBody>) {
+fn reject(
+    status: StatusCode,
+    code: &'static str,
+    err: JwtError,
+) -> (StatusCode, Json<crate::ErrorBody>) {
     warn!(error = %err, "rejecting request");
     (
         status,
-        Json(ErrorBody {
+        Json(crate::ErrorBody {
             error: code,
             message: err.to_string(),
         }),

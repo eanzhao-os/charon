@@ -45,6 +45,7 @@ thiserror = "2"
 # misc
 futures = "0.3.31"
 directories = "6"
+tempfile = "3"
 
 [profile.release]
 lto = "thin"

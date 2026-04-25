@@ -6,7 +6,7 @@ use charon_core::{
     DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER, DEFAULT_USER_SERVICE_SLUG, HealthResponse,
     NyxIdentity, WhoAmIResponse,
 };
-use charon_daemon::{DEFAULT_EXPECTED_AUD, DaemonConfig};
+use charon_daemon::{DEFAULT_EXPECTED_AUD, DaemonConfig, default_home};
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
@@ -54,6 +54,9 @@ enum DaemonCmd {
         expected_aud: String,
         #[arg(long, env = "CHARON_NYXID_ISSUER", default_value = DEFAULT_NYXID_ISSUER)]
         nyxid_issuer: String,
+        /// Daemon state dir (workspaces.json, worktrees/, …). Defaults to ~/.charon.
+        #[arg(long, env = "CHARON_HOME")]
+        home: Option<PathBuf>,
     },
     /// Hit the daemon's /api/v1/health endpoint.
     Status {
@@ -73,8 +76,9 @@ async fn main() -> Result<()> {
                     bind,
                     expected_aud,
                     nyxid_issuer,
+                    home,
                 },
-        } => start_daemon(bind, expected_aud, nyxid_issuer).await,
+        } => start_daemon(bind, expected_aud, nyxid_issuer, home).await,
         Cmd::Daemon {
             sub: DaemonCmd::Status { endpoint },
         } => status(&endpoint).await,
@@ -86,13 +90,23 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn start_daemon(bind: String, expected_aud: String, nyxid_issuer: String) -> Result<()> {
+async fn start_daemon(
+    bind: String,
+    expected_aud: String,
+    nyxid_issuer: String,
+    home: Option<PathBuf>,
+) -> Result<()> {
+    let home = match home {
+        Some(p) => p,
+        None => default_home()?,
+    };
     let config = DaemonConfig {
         bind: bind
             .parse()
             .with_context(|| format!("invalid bind {bind}"))?,
         expected_aud,
         nyxid_issuer,
+        home,
     };
     let shutdown = CancellationToken::new();
     let signal_token = shutdown.clone();
