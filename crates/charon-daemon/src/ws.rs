@@ -19,9 +19,9 @@ use charon_core::{
 use chrono::Utc;
 use tracing::{debug, info, warn};
 
-use crate::AppState;
 use crate::nyxid_jwt::IdentityToken;
 use crate::workspace::WorkspaceManager;
+use crate::{AppState, diff, files};
 
 const HEARTBEAT: Duration = Duration::from_secs(60);
 
@@ -140,6 +140,90 @@ async fn dispatch(socket: &mut WebSocket, workspaces: &Arc<WorkspaceManager>, te
                     send_or_warn(socket, &ServerFrame::WorkspaceArchived { id, result: w }).await;
                 }
                 Err(e) => send_error(socket, Some(id), "archive_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::FileList { id, payload } => {
+            let ws = match workspaces.get(&payload.workspace_id).await {
+                Some(ws) => ws,
+                None => {
+                    send_error(
+                        socket,
+                        Some(id),
+                        "not_found",
+                        format!("workspace {} not found", payload.workspace_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match files::tree(&ws, &payload.path, payload.depth).await {
+                Ok(result) => {
+                    send_or_warn(socket, &ServerFrame::FileListed { id, result }).await;
+                }
+                Err(e) => send_error(socket, Some(id), "tree_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::FileRead { id, payload } => {
+            let ws = match workspaces.get(&payload.workspace_id).await {
+                Some(ws) => ws,
+                None => {
+                    send_error(
+                        socket,
+                        Some(id),
+                        "not_found",
+                        format!("workspace {} not found", payload.workspace_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match files::read(&ws, &payload.path).await {
+                Ok(result) => {
+                    send_or_warn(socket, &ServerFrame::FileContent { id, result }).await;
+                }
+                Err(e) => send_error(socket, Some(id), "read_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::FileWrite { id, payload } => {
+            let ws = match workspaces.get(&payload.workspace_id).await {
+                Some(ws) => ws,
+                None => {
+                    send_error(
+                        socket,
+                        Some(id),
+                        "not_found",
+                        format!("workspace {} not found", payload.workspace_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match files::write(&ws, &payload.path, &payload.content).await {
+                Ok(result) => {
+                    send_or_warn(socket, &ServerFrame::FileWritten { id, result }).await;
+                }
+                Err(e) => send_error(socket, Some(id), "write_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::DiffGet { id, payload } => {
+            let ws = match workspaces.get(&payload.workspace_id).await {
+                Some(ws) => ws,
+                None => {
+                    send_error(
+                        socket,
+                        Some(id),
+                        "not_found",
+                        format!("workspace {} not found", payload.workspace_id),
+                    )
+                    .await;
+                    return;
+                }
+            };
+            match diff::diff(&ws).await {
+                Ok(result) => {
+                    send_or_warn(socket, &ServerFrame::DiffSnapshot { id, result }).await;
+                }
+                Err(e) => send_error(socket, Some(id), "diff_failed", e.to_string()).await,
             }
         }
     }

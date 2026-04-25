@@ -108,6 +108,23 @@ pub enum ClientFrame {
         id: String,
         payload: WorkspaceIdPayload,
     },
+    #[serde(rename = "File.List")]
+    FileList {
+        id: String,
+        payload: FileTreePayload,
+    },
+    #[serde(rename = "File.Read")]
+    FileRead {
+        id: String,
+        payload: FilePathPayload,
+    },
+    #[serde(rename = "File.Write")]
+    FileWrite {
+        id: String,
+        payload: FileWritePayload,
+    },
+    #[serde(rename = "Diff.Get")]
+    DiffGet { id: String, payload: DiffPayload },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +143,17 @@ pub enum ServerFrame {
     WorkspaceGot { id: String, result: Workspace },
     #[serde(rename = "Workspace.Archived")]
     WorkspaceArchived { id: String, result: Workspace },
+    #[serde(rename = "File.Listed")]
+    FileListed {
+        id: String,
+        result: FileTreeResponse,
+    },
+    #[serde(rename = "File.Content")]
+    FileContent { id: String, result: FileContent },
+    #[serde(rename = "File.Written")]
+    FileWritten { id: String, result: FileContent },
+    #[serde(rename = "Diff.Snapshot")]
+    DiffSnapshot { id: String, result: DiffResponse },
     #[serde(rename = "Error")]
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -161,4 +189,99 @@ pub struct ServerInfo {
 pub struct WsError {
     pub code: String,
     pub message: String,
+}
+
+// ---------- file / diff (M2.3) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileEntry {
+    /// Path relative to workspace root.
+    pub path: String,
+    pub kind: FileKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileKind {
+    File,
+    Dir,
+    Symlink,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTreeResponse {
+    pub workspace_id: String,
+    pub path: String,
+    pub entries: Vec<FileEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileContent {
+    pub workspace_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFileRequest {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffResponse {
+    pub workspace_id: String,
+    pub base_branch: String,
+    pub changed: Vec<FileDiff>,
+    pub untracked: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub status: DiffStatus,
+    pub unified_diff: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Other,
+}
+
+// WS payloads for file / diff frames
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileTreePayload {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default = "default_tree_depth")]
+    pub depth: u32,
+}
+
+fn default_tree_depth() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilePathPayload {
+    pub workspace_id: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileWritePayload {
+    pub workspace_id: String,
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffPayload {
+    pub workspace_id: String,
 }

@@ -3,6 +3,8 @@
 //! `serve(config, shutdown)` is the only public surface. Both the
 //! `charon-daemon` binary and `charon-cli`'s `daemon start` call it.
 
+pub mod diff;
+pub mod files;
 pub mod nyxid_jwt;
 pub mod workspace;
 pub mod ws;
@@ -18,7 +20,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use charon_core::{
     CreateWorkspaceRequest, DAEMON_VERSION, DEFAULT_DAEMON_BIND, DEFAULT_NYXID_ISSUER,
-    HealthResponse, ListWorkspacesResponse, WS_PATH, WhoAmIResponse, Workspace,
+    DiffResponse, FileContent, FileTreeResponse, HealthResponse, ListWorkspacesResponse, WS_PATH,
+    WhoAmIResponse, Workspace, WriteFileRequest,
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -112,6 +115,12 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/workspaces/{id}/archive",
             post(archive_workspace_handler),
         )
+        .route("/api/v1/workspaces/{id}/tree", get(tree_handler))
+        .route(
+            "/api/v1/workspaces/{id}/file",
+            get(file_read_handler).put(file_write_handler),
+        )
+        .route("/api/v1/workspaces/{id}/diff", get(diff_handler))
         .route(WS_PATH, get(ws::ws_upgrade_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -223,6 +232,88 @@ async fn archive_workspace_handler(
         .await
         .map(Json)
         .map_err(|e| err(StatusCode::NOT_FOUND, "archive_failed", e.to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+struct TreeQuery {
+    #[serde(default)]
+    path: String,
+    #[serde(default = "default_tree_depth")]
+    depth: u32,
+}
+
+fn default_tree_depth() -> u32 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+struct FileQuery {
+    path: String,
+}
+
+async fn fetch_workspace_or_404(
+    workspaces: &WorkspaceManager,
+    id: &str,
+) -> Result<Workspace, (StatusCode, Json<ErrorBody>)> {
+    workspaces.get(id).await.ok_or_else(|| {
+        err(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("workspace {id}"),
+        )
+    })
+}
+
+async fn tree_handler(
+    State(workspaces): State<Arc<WorkspaceManager>>,
+    IdentityToken(_identity): IdentityToken,
+    Path(id): Path<String>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Json<FileTreeResponse>, (StatusCode, Json<ErrorBody>)> {
+    let ws = fetch_workspace_or_404(&workspaces, &id).await?;
+    files::tree(&ws, &q.path, q.depth)
+        .await
+        .map(Json)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "tree_failed", e.to_string()))
+}
+
+async fn file_read_handler(
+    State(workspaces): State<Arc<WorkspaceManager>>,
+    IdentityToken(_identity): IdentityToken,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+) -> Result<Json<FileContent>, (StatusCode, Json<ErrorBody>)> {
+    let ws = fetch_workspace_or_404(&workspaces, &id).await?;
+    files::read(&ws, &q.path)
+        .await
+        .map(Json)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "read_failed", e.to_string()))
+}
+
+async fn file_write_handler(
+    State(workspaces): State<Arc<WorkspaceManager>>,
+    IdentityToken(_identity): IdentityToken,
+    Path(id): Path<String>,
+    Query(q): Query<FileQuery>,
+    Json(body): Json<WriteFileRequest>,
+) -> Result<Json<FileContent>, (StatusCode, Json<ErrorBody>)> {
+    let ws = fetch_workspace_or_404(&workspaces, &id).await?;
+    files::write(&ws, &q.path, &body.content)
+        .await
+        .map(Json)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "write_failed", e.to_string()))
+}
+
+async fn diff_handler(
+    State(workspaces): State<Arc<WorkspaceManager>>,
+    IdentityToken(_identity): IdentityToken,
+    Path(id): Path<String>,
+) -> Result<Json<DiffResponse>, (StatusCode, Json<ErrorBody>)> {
+    let ws = fetch_workspace_or_404(&workspaces, &id).await?;
+    diff::diff(&ws)
+        .await
+        .map(Json)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, "diff_failed", e.to_string()))
 }
 
 #[cfg(test)]

@@ -12,7 +12,7 @@
 |---|---|---|---|
 | **M2.1 Workspace 模型** | git worktree manager（shell-out 到 `git`）、`~/.charon/workspaces.json` 持久化、`POST/GET /api/v1/workspaces`、`POST /api/v1/workspaces/:id/archive`，全部走 `IdentityToken` | M1 | ✅ 2026-04-25 |
 | **M2.2 WS 协议** | `GET /api/v1/ws` 升级（JWT at upgrade only）；JSON envelope；帧命名空间起步 `Workspace.*`；60s 服务端 Ping；Hello 帧带 identity；Error 帧带原 request id；二进制 attachment 留给 M2.3/M2.4 真用得着再做 | M2.1 | ✅ 2026-04-25 |
-| **M2.3 File / Diff API** | 路径校验严格在 worktree 内（`canonicalize` 前缀 check）；`gix` 算 working-tree vs base diff，按文件分块；`notify` 监听变化；大文件 (>1MB) 分片帧 | M2.2 | ⏳ |
+| **M2.3 File / Diff API** | 路径 sandbox（lexical `safe_join`，拒 `../` + 绝对路径）；`File.{List,Read,Write}` REST + WS（UTF-8 only，binary 留 M2.4）；`Diff.Get` shell-out `git diff` + `ls-files --others`，per-file unified diff | M2.2 | ✅ 2026-04-26 |
 | **M2.4 Terminal** | `pty-process` 起 shell；scrollback 16K 行 ring buffer；resize / 特殊键 / 颜色保留；多 terminal/workspace | M2.2 | ⏳ |
 | **M2.5 Tauri desktop shell** | `crates/charon-desktop`：Tauri v2 + React 19 + TanStack + Tailwind 4；NyxID OAuth in webview → UserService 发现 → WS 连接；workspace 树 / diff 视图 / xterm.js terminal | M2.2-M2.4 | ⏳ |
 | **M2.6 `charon link` + 配置收尾** | 自动化 `nyxid node register` + `nyxid service add`，把 slug/credential 写到 `~/.charon/config.toml`；`charon doctor` 改读 config 而不是 `DEFAULT_USER_SERVICE_SLUG` | 任意时机 | ⏳ |
@@ -106,6 +106,58 @@ JWT 验签发生在 `IdentityToken` extractor，axum 的 `WebSocketUpgrade` 也�
 - **二进制 attachment 36B UUID 前缀延后**：M2.2 没用例（终端输出 / 文件 blob 都是 M2.3/M2.4 的事），所以协议帧里没有 `binary_attachment_ref` 字段。等到 M2.3 加 `Diff.Blob` / M2.4 加 `Terminal.Output` 时一起补，wire 类型 enum 加变体即可向后兼容。
 - **应用层 Ping/Pong 不做**：直接用 WebSocket 协议级 Ping（每 60s 服务器主动发），客户端 / NyxID node 自动回 Pong，不污染 JSON envelope。
 - **没起 `charon ws probe` 子命令**：直接把 WS 探测塞进 `doctor` 第 4 步，避免新命令 + 重复实现。等 desktop client 上来了再考虑独立的 `charon ws connect` REPL。
+
+## M2.3 实施进度（live log）
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| File / Diff wire 类型 | ✅ | `FileEntry` / `FileKind` / `FileTreeResponse` / `FileContent` / `WriteFileRequest` / `DiffResponse` / `FileDiff` / `DiffStatus` + 4 个 WS payload 类型；`ClientFrame` +4、`ServerFrame` +4 |
+| `charon-daemon::files` | ✅ | `safe_join`（lexical，拒 `..` 越界 + 拒绝对路径 + 跳过 `.` 当前目录）、`tree`（BFS + depth limit + 跳 `.git`）、`read`（UTF-8 only，明确报错 fallback 给 M2.4）、`write`（自动 `create_dir_all` parent）；6 个单测全过 |
+| `charon-daemon::diff` | ✅ | shell-out `git -C <wt> diff --name-status <base>` 拿改动列表，per-file `git diff <base> -- <path>` 拿 unified diff；`git ls-files --others --exclude-standard` 拿 untracked |
+| REST handlers | ✅ | `GET /workspaces/{id}/tree?path=&depth=`、`GET/PUT /workspaces/{id}/file?path=`、`GET /workspaces/{id}/diff`，全 `IdentityToken` 鉴权；`fetch_workspace_or_404` 助手统一 404 |
+| WS dispatch | ✅ | `File.List → File.Listed`、`File.Read → File.Content`、`File.Write → File.Written`、`Diff.Get → Diff.Snapshot`，复用 `files` / `diff` 业务逻辑 |
+| 端到端实测 | ✅ | 见下文 |
+
+### M2.3 端到端实测（2026-04-26）
+
+测试 repo：`/tmp/charon-m23-test`（init -b main，1 commit 含 `README.md` + `src/main.rs`）。
+
+| # | 操作 | 结果 |
+|---|---|---|
+| 1 | POST 创建 workspace 指向该 repo | ✅ 201，分配 `charon/1ee3814b` 分支 |
+| 2 | GET tree (depth=1) | ✅ `[README.md, src/]` |
+| 3 | GET tree (depth=5) | ✅ 加上 `src/main.rs` |
+| 4 | GET file `src/main.rs` | ✅ 原始内容 |
+| 5 | PUT file `src/main.rs` (改) | ✅ 200 |
+| 6 | PUT file `src/util.rs` (新建) | ✅ 200，自动 mkdir parent |
+| 7 | PUT file `../escape.txt` (sandbox) | ✅ 400 `path '../escape.txt' escapes workspace` |
+| 8 | GET diff | ✅ `changed: [{path: src/main.rs, status: modified, unified_diff: "..."}]`、`untracked: [src/util.rs]` |
+| 9 | GET file 不存在路径 | ✅ 400 `read_failed` |
+| 10 | GET tree on a file path | ✅ 400 `is not a directory` |
+| 11 | GET diff on 不存在 workspace | ✅ 404 |
+| 12 | doctor 4 步全过（WS 复测） | ✅ |
+
+`diff` 实际响应（精简）：
+
+```json
+{
+  "workspace_id": "1ee3814b-...",
+  "base_branch": "main",
+  "changed": [{
+    "path": "src/main.rs",
+    "status": "modified",
+    "unified_diff": "diff --git a/src/main.rs b/src/main.rs\nindex 7b16f1f..acb2da2 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1,3 @@\n-fn main() { println!(\"hi\"); }\n+fn main() {\n+    println!(\"hi from charon\");\n+}\n"
+  }],
+  "untracked": ["src/util.rs"]
+}
+```
+
+### M2.3 偏差
+
+- **没用 gix 算 diff**：直接 shell-out `git`。理由：gix 的 working-tree-vs-tree diff 高级 API 不齐，自己拼太重。等 M3+ 性能成瓶颈再考虑切。
+- **No subscription / `notify` watch**：M2.3 只做一次性 `Diff.Get`。`File.Watch` / `Diff.Subscribe` 等 push 通道留给 M3 的 agent timeline 一起做（subscription 帧需要 sub_id 字段，到时 wire 协议加一轮）。
+- **No binary read/write**：UTF-8 only，碰到二进制文件返清晰错误。binary attachment plumbing 在 M2.4 用 PTY 输出时一起加。
+- **No gitignore filter**：`tree` 不读 `.gitignore`，会列出 `target/` `node_modules/` 这种。等 frontend 真碰到性能问题再考虑用 `git ls-files --cached --others --exclude-standard` 替代。
 
 ### M2.1 端到端实测（2026-04-25）
 
