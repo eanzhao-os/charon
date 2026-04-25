@@ -41,6 +41,7 @@ tracing-subscriber.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
+fs2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
