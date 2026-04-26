@@ -117,12 +117,21 @@ M1 已经能：
 # 1. 编
 cargo build --release --workspace
 
-# 2. 起 daemon（绑 127.0.0.1:18789）
+# 2. 配 owner 并起 daemon（绑 127.0.0.1:18789）
+export CHARON_OWNER_USER_ID="<your NyxID user_id>"
 ./target/release/charon-daemon
 # 或 cargo run -p charon-daemon
 
 # 3. 自检
 ./target/release/charon doctor
+```
+
+不知道自己的 NyxID `user_id` 时，可以先用临时值启动 daemon，只访问 `/whoami` 拿真实值，再用真实 owner 重启：
+
+```bash
+CHARON_OWNER_USER_ID=bootstrap ./target/release/charon-daemon
+curl -H "Authorization: Bearer $(cat ~/.nyxid/access_token)" \
+  https://nyx-api.chrono-ai.fun/api/v1/proxy/s/charon-echo-poc/api/v1/whoami
 ```
 
 期望输出：
@@ -140,7 +149,7 @@ cargo build --release --workspace
 All checks passed.
 ```
 
-环境变量（都有 sensible default）：`CHARON_BIND` / `CHARON_EXPECTED_AUD` / `CHARON_NYXID_ISSUER` / `CHARON_ENDPOINT` / `CHARON_NYXID_BASE_URL` / `CHARON_DOCTOR_SLUG`。完整列表见 [`docs/05`](docs/05-poc-results-and-next-steps.md#env-控制点速查)。
+环境变量：`CHARON_OWNER_USER_ID` 必填；`CHARON_BIND` / `CHARON_EXPECTED_AUD` / `CHARON_NYXID_ISSUER` / `CHARON_ENDPOINT` / `CHARON_NYXID_BASE_URL` / `CHARON_DOCTOR_SLUG` 有默认值。完整列表见 [`docs/05`](docs/05-poc-results-and-next-steps.md#env-控制点速查)。
 
 ## 仓库布局
 

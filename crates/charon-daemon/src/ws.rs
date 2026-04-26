@@ -21,7 +21,7 @@ use chrono::Utc;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{debug, info, warn};
 
-use crate::nyxid_jwt::IdentityToken;
+use crate::nyxid_jwt::OwnerIdentity;
 use crate::terminal::{TerminalEvent, TerminalManager};
 use crate::workspace::WorkspaceManager;
 use crate::{AppState, diff, files};
@@ -31,7 +31,7 @@ const HEARTBEAT: Duration = Duration::from_secs(60);
 pub async fn ws_upgrade_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
-    IdentityToken(identity): IdentityToken,
+    OwnerIdentity(identity): OwnerIdentity,
 ) -> Response {
     info!(user_id = %identity.user_id, "WS upgrade");
     ws.on_upgrade(move |socket| run_session(socket, state, identity))

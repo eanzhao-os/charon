@@ -82,6 +82,8 @@ enum DaemonCmd {
         expected_aud: String,
         #[arg(long, env = "CHARON_NYXID_ISSUER", default_value = DEFAULT_NYXID_ISSUER)]
         nyxid_issuer: String,
+        #[arg(long, env = "CHARON_OWNER_USER_ID")]
+        owner_user_id: String,
         /// Daemon state dir (workspaces.json, worktrees/, …). Defaults to ~/.charon.
         #[arg(long, env = "CHARON_HOME")]
         home: Option<PathBuf>,
@@ -104,9 +106,10 @@ async fn main() -> Result<()> {
                     bind,
                     expected_aud,
                     nyxid_issuer,
+                    owner_user_id,
                     home,
                 },
-        } => start_daemon(bind, expected_aud, nyxid_issuer, home).await,
+        } => start_daemon(bind, expected_aud, nyxid_issuer, owner_user_id, home).await,
         Cmd::Daemon {
             sub: DaemonCmd::Status { endpoint },
         } => status(&endpoint).await,
@@ -130,6 +133,7 @@ async fn start_daemon(
     bind: String,
     expected_aud: String,
     nyxid_issuer: String,
+    owner_user_id: String,
     home: Option<PathBuf>,
 ) -> Result<()> {
     let home = match home {
@@ -142,6 +146,7 @@ async fn start_daemon(
             .with_context(|| format!("invalid bind {bind}"))?,
         expected_aud,
         nyxid_issuer,
+        owner_user_id,
         home,
     };
     let shutdown = CancellationToken::new();
