@@ -69,8 +69,9 @@ enum WsCmd {
         #[arg(long, env = "CHARON_DOCTOR_SLUG", default_value = DEFAULT_USER_SERVICE_SLUG)]
         slug: String,
         /// Project root for the throwaway workspace (auto git-init'd if needed).
-        #[arg(long, default_value = "/tmp/charon-probe")]
-        project_root: PathBuf,
+        /// Defaults to a fresh per-invocation tempdir, removed on exit.
+        #[arg(long)]
+        project_root: Option<PathBuf>,
     },
 }
 
@@ -143,7 +144,7 @@ async fn main() -> Result<()> {
                     slug,
                     project_root,
                 },
-        } => probe_terminal(&base_url, &slug, &project_root).await,
+        } => probe_terminal(&base_url, &slug, project_root).await,
     }
 }
 
@@ -316,9 +317,7 @@ async fn ws_handshake_probe(ws_url: &str) -> Result<NyxIdentity> {
             include_archived: true,
         },
     };
-    let req_text = serde_json::to_string(&req_frame).context("serialize Workspace.List")?;
-    socket
-        .send(TungsteniteMessage::Text(req_text.into()))
+    send_client_frame(&mut socket, &req_frame)
         .await
         .context("send Workspace.List")?;
     match recv_server_frame(&mut socket).await? {
@@ -376,23 +375,25 @@ where
 }
 
 async fn ensure_git_repo(path: &Path) -> Result<()> {
-    if !path.exists() {
-        std::fs::create_dir_all(path).with_context(|| format!("mkdir {}", path.display()))?;
-    }
-    let probe = std::process::Command::new("git")
+    tokio::fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("mkdir {}", path.display()))?;
+    let probe = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
+        .await
         .context("exec `git rev-parse`")?;
     if probe.status.success() {
         return Ok(());
     }
-    let init = std::process::Command::new("git")
+    let init = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
         .args(["init", "-q", "-b", "main"])
         .output()
+        .await
         .context("exec `git init`")?;
     if !init.status.success() {
         bail!(
@@ -400,7 +401,7 @@ async fn ensure_git_repo(path: &Path) -> Result<()> {
             String::from_utf8_lossy(&init.stderr).trim()
         );
     }
-    let commit = std::process::Command::new("git")
+    let commit = tokio::process::Command::new("git")
         .arg("-C")
         .arg(path)
         .args([
@@ -415,6 +416,7 @@ async fn ensure_git_repo(path: &Path) -> Result<()> {
             "init",
         ])
         .output()
+        .await
         .context("exec `git commit`")?;
     if !commit.status.success() {
         bail!(
@@ -425,8 +427,17 @@ async fn ensure_git_repo(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn probe_terminal(base_url: &str, slug: &str, project_root: &Path) -> Result<()> {
+async fn probe_terminal(base_url: &str, slug: &str, project_root: Option<PathBuf>) -> Result<()> {
     println!("== charon ws probe-terminal ==\n");
+
+    let (project_root, _temp_guard) = match project_root {
+        Some(p) => (p, None),
+        None => {
+            let td = tempfile::tempdir().context("create probe tempdir")?;
+            (td.path().to_path_buf(), Some(td))
+        }
+    };
+    let project_root = project_root.as_path();
 
     ensure_git_repo(project_root)
         .await
