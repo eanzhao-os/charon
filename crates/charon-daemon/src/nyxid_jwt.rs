@@ -31,7 +31,7 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::Deserialize;
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, info, warn};
 
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -132,6 +132,7 @@ pub struct JwksClient {
     http: reqwest::Client,
     jwks_fetcher: Arc<dyn JwksFetcher>,
     clock: Arc<dyn Clock>,
+    refresh_in_flight: AsyncMutex<()>,
     inner: RwLock<Cache>,
 }
 
@@ -211,6 +212,7 @@ impl JwksClient {
             http,
             jwks_fetcher,
             clock: clock.clone(),
+            refresh_in_flight: AsyncMutex::new(()),
             inner: RwLock::new(Cache {
                 jwks_uri: discovery.jwks_uri,
                 keys,
@@ -234,7 +236,7 @@ impl JwksClient {
             None => {
                 debug!(kid = %kid, "kid miss; refreshing JWKS");
                 if !refreshed_for_ttl {
-                    self.refresh_for_kid_miss().await?;
+                    self.refresh_for_kid_miss(&kid).await?;
                 }
                 self.lookup_key(&kid)
                     .await
@@ -258,37 +260,85 @@ impl JwksClient {
     }
 
     async fn refresh_if_expired(&self) -> Result<bool, JwtError> {
-        let mut cache = self.inner.write().await;
-        if self.clock.now().duration_since(cache.fetched_at) < JWKS_CACHE_TTL {
-            return Ok(false);
+        {
+            let cache = self.inner.read().await;
+            if self.clock.now().duration_since(cache.fetched_at) < JWKS_CACHE_TTL {
+                return Ok(false);
+            }
         }
 
         debug!("JWKS cache TTL expired; refreshing before verification");
-        self.refresh_locked(&mut cache).await?;
+        let _refresh = self.refresh_in_flight.lock().await;
+        let jwks_uri = {
+            let cache = self.inner.read().await;
+            if self.clock.now().duration_since(cache.fetched_at) < JWKS_CACHE_TTL {
+                return Ok(true);
+            }
+            cache.jwks_uri.clone()
+        };
+
+        self.refresh_from_uri(&jwks_uri, None).await?;
         Ok(true)
     }
 
-    async fn refresh_for_kid_miss(&self) -> Result<bool, JwtError> {
-        let mut cache = self.inner.write().await;
-        let now = self.clock.now();
-        if let Some(last) = cache.last_kid_miss_refresh_at
-            && now.duration_since(last) < JWKS_KID_MISS_REFRESH_THROTTLE
+    async fn refresh_for_kid_miss(&self, kid: &str) -> Result<bool, JwtError> {
         {
-            return Ok(false);
+            let cache = self.inner.read().await;
+            let now = self.clock.now();
+            if let Some(last) = cache.last_kid_miss_refresh_at
+                && now.duration_since(last) < JWKS_KID_MISS_REFRESH_THROTTLE
+            {
+                return Ok(false);
+            }
         }
 
-        cache.last_kid_miss_refresh_at = Some(now);
-        self.refresh_locked(&mut cache).await?;
-        Ok(true)
+        let _refresh = self.refresh_in_flight.lock().await;
+        let jwks_uri = {
+            let cache = self.inner.read().await;
+            if cache.keys.contains_key(kid) {
+                return Ok(false);
+            }
+            let now = self.clock.now();
+            if let Some(last) = cache.last_kid_miss_refresh_at
+                && now.duration_since(last) < JWKS_KID_MISS_REFRESH_THROTTLE
+            {
+                return Ok(false);
+            }
+            cache.jwks_uri.clone()
+        };
+
+        match self
+            .refresh_from_uri(&jwks_uri, Some(self.clock.now()))
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                self.record_kid_miss_refresh_attempt(self.clock.now()).await;
+                Err(err)
+            }
+        }
     }
 
-    async fn refresh_locked(&self, cache: &mut Cache) -> Result<(), JwtError> {
-        let keys = self.jwks_fetcher.fetch(&self.http, &cache.jwks_uri).await?;
+    async fn refresh_from_uri(
+        &self,
+        jwks_uri: &str,
+        kid_miss_refresh_at: Option<Instant>,
+    ) -> Result<(), JwtError> {
+        let keys = self.jwks_fetcher.fetch(&self.http, jwks_uri).await?;
         let n = keys.len();
+        let mut cache = self.inner.write().await;
         cache.keys = keys;
         cache.fetched_at = self.clock.now();
+        if let Some(refreshed_at) = kid_miss_refresh_at {
+            cache.last_kid_miss_refresh_at = Some(refreshed_at);
+        }
         info!(key_count = n, "JWKS refreshed");
         Ok(())
+    }
+
+    async fn record_kid_miss_refresh_attempt(&self, attempted_at: Instant) {
+        let mut cache = self.inner.write().await;
+        cache.last_kid_miss_refresh_at = Some(attempted_at);
     }
 
     #[cfg(test)]
@@ -306,6 +356,7 @@ impl JwksClient {
             http: reqwest::Client::new(),
             jwks_fetcher,
             clock: clock.clone(),
+            refresh_in_flight: AsyncMutex::new(()),
             inner: RwLock::new(Cache {
                 jwks_uri: jwks_uri.into(),
                 keys,
@@ -337,6 +388,7 @@ impl JwksClient {
             http: reqwest::Client::new(),
             jwks_fetcher: Arc::new(HttpJwksFetcher),
             clock: clock.clone(),
+            refresh_in_flight: AsyncMutex::new(()),
             inner: RwLock::new(Cache {
                 jwks_uri: "test://jwks".to_string(),
                 keys,
@@ -489,6 +541,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     const ISSUER: &str = "https://issuer.test";
     const AUD: &str = "http://localhost:18789";
@@ -598,13 +651,19 @@ acIKunZfdeu3s95nsCD3HfSe
     struct StubJwksFetcher {
         responses: Mutex<VecDeque<KeyMap>>,
         fetch_count: AtomicUsize,
+        delay: Duration,
     }
 
     impl StubJwksFetcher {
         fn new(responses: Vec<KeyMap>) -> Arc<Self> {
+            Self::with_delay(responses, Duration::ZERO)
+        }
+
+        fn with_delay(responses: Vec<KeyMap>, delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 fetch_count: AtomicUsize::new(0),
+                delay,
             })
         }
 
@@ -617,12 +676,66 @@ acIKunZfdeu3s95nsCD3HfSe
         fn fetch<'a>(&'a self, _http: &'a reqwest::Client, _jwks_uri: &'a str) -> BoxJwksFetch<'a> {
             Box::pin(async move {
                 self.fetch_count.fetch_add(1, Ordering::SeqCst);
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
                 Ok(self
                     .responses
                     .lock()
                     .unwrap()
                     .pop_front()
                     .expect("stub JWKS response"))
+            })
+        }
+    }
+
+    struct BlockingJwksFetcher {
+        responses: Mutex<VecDeque<KeyMap>>,
+        fetch_count: AtomicUsize,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl BlockingJwksFetcher {
+        fn new(responses: Vec<KeyMap>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(VecDeque::from(responses)),
+                fetch_count: AtomicUsize::new(0),
+                started: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetch_count.load(Ordering::SeqCst)
+        }
+
+        async fn wait_for_fetch_started(&self) {
+            loop {
+                if self.fetch_count() > 0 {
+                    return;
+                }
+                self.started.notified().await;
+            }
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    impl JwksFetcher for BlockingJwksFetcher {
+        fn fetch<'a>(&'a self, _http: &'a reqwest::Client, _jwks_uri: &'a str) -> BoxJwksFetch<'a> {
+            Box::pin(async move {
+                self.fetch_count.fetch_add(1, Ordering::SeqCst);
+                self.started.notify_waiters();
+                self.release.notified().await;
+                Ok(self
+                    .responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("blocking JWKS response"))
             })
         }
     }
@@ -775,6 +888,74 @@ acIKunZfdeu3s95nsCD3HfSe
 
         assert_eq!(identity.user_id, "user_123");
         assert_eq!(fetcher.fetch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn known_kid_verify_does_not_wait_for_slow_kid_miss_refresh() {
+        let clock = ManualClock::new();
+        let fetcher = BlockingJwksFetcher::new(vec![keys_for("kid-2", KEY2_N)]);
+        let client = Arc::new(client_with(
+            keys_for("kid-1", KEY1_N),
+            fetcher.clone(),
+            clock,
+        ));
+        let known_token = encode_token(Some("kid-1"), KEY1_PEM, &test_claims());
+        let miss_token = Arc::new(encode_token(Some("kid-2"), KEY2_PEM, &test_claims()));
+
+        let refreshing = tokio::spawn({
+            let client = client.clone();
+            let miss_token = miss_token.clone();
+            async move { client.verify(miss_token.as_str()).await }
+        });
+
+        fetcher.wait_for_fetch_started().await;
+
+        let known =
+            tokio::time::timeout(Duration::from_secs(1), client.verify(known_token.as_str())).await;
+        fetcher.release();
+        let known = known
+            .expect("known-kid verify should not wait behind JWKS fetch")
+            .unwrap();
+
+        assert_eq!(known.user_id, "user_123");
+        assert_eq!(refreshing.await.unwrap().unwrap().user_id, "user_123");
+        assert_eq!(fetcher.fetch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_kid_miss_verifies_share_slow_refresh() {
+        let clock = ManualClock::new();
+        let fetcher = StubJwksFetcher::with_delay(
+            vec![keys_for("kid-2", KEY2_N)],
+            Duration::from_millis(200),
+        );
+        let client = Arc::new(client_with(
+            keys_for("kid-1", KEY1_N),
+            fetcher.clone(),
+            clock,
+        ));
+        let token = Arc::new(encode_token(Some("kid-2"), KEY2_PEM, &test_claims()));
+        let started = Instant::now();
+
+        let first = {
+            let client = client.clone();
+            let token = token.clone();
+            async move { client.verify(token.as_str()).await }
+        };
+        let second = {
+            let client = client.clone();
+            let token = token.clone();
+            async move { client.verify(token.as_str()).await }
+        };
+        let (first, second) = tokio::join!(first, second);
+
+        assert_eq!(first.unwrap().user_id, "user_123");
+        assert_eq!(second.unwrap().user_id, "user_123");
+        assert_eq!(fetcher.fetch_count(), 1);
+        assert!(
+            started.elapsed() < Duration::from_millis(350),
+            "concurrent verifies should share one slow JWKS refresh"
+        );
     }
 
     #[tokio::test]
