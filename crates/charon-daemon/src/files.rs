@@ -1,13 +1,14 @@
 //! File operations within a workspace's worktree (M2.3).
 //!
 //! All paths are sandboxed via lexical normalization (`..` traversal beyond
-//! workspace root is rejected, absolute paths are rejected). Symlink-following
-//! attacks would require a malicious source repo, which is the user's problem.
+//! workspace root is rejected, absolute paths are rejected), then canonicalized
+//! so symlinks cannot escape the workspace.
 //!
 //! M2.3 ships UTF-8 only — non-UTF-8 read/write returns a clear error pointing
 //! at M2.4 when binary attachment plumbing lands with terminals.
 
 use std::collections::VecDeque;
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -33,8 +34,81 @@ pub fn safe_join(base: &Path, rel: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+async fn canonical_base(base: &Path) -> Result<PathBuf> {
+    tokio::fs::canonicalize(base)
+        .await
+        .with_context(|| format!("canonicalize workspace {}", base.display()))
+}
+
+fn ensure_in_workspace(canonical_base: &Path, canonical_path: &Path, rel: &str) -> Result<()> {
+    if canonical_path.starts_with(canonical_base) {
+        Ok(())
+    } else {
+        bail!("path '{}' escapes workspace", rel);
+    }
+}
+
+async fn resolve_existing_path(base: &Path, rel: &str) -> Result<PathBuf> {
+    let abs = safe_join(base, rel)?;
+    let canonical_base = canonical_base(base).await?;
+    let canonical_path = tokio::fs::canonicalize(&abs)
+        .await
+        .with_context(|| format!("canonicalize {}", abs.display()))?;
+    ensure_in_workspace(&canonical_base, &canonical_path, rel)?;
+    Ok(abs)
+}
+
+async fn ensure_creatable_path(
+    base: &Path,
+    canonical_base: &Path,
+    abs: &Path,
+    rel: &str,
+) -> Result<()> {
+    let parent = abs
+        .parent()
+        .with_context(|| format!("path '{}' has no parent", rel))?;
+    let mut ancestor = parent.to_path_buf();
+    loop {
+        if !ancestor.starts_with(base) {
+            bail!("path '{}' escapes workspace", rel);
+        }
+        match tokio::fs::symlink_metadata(&ancestor).await {
+            Ok(_) => {
+                let canonical_ancestor = tokio::fs::canonicalize(&ancestor)
+                    .await
+                    .with_context(|| format!("canonicalize {}", ancestor.display()))?;
+                ensure_in_workspace(canonical_base, &canonical_ancestor, rel)?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                if !ancestor.pop() {
+                    bail!("path '{}' escapes workspace", rel);
+                }
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("stat {}", ancestor.display()));
+            }
+        }
+    }
+}
+
+async fn resolve_write_path(base: &Path, rel: &str) -> Result<(PathBuf, PathBuf)> {
+    let abs = safe_join(base, rel)?;
+    let canonical_base = canonical_base(base).await?;
+    match tokio::fs::canonicalize(&abs).await {
+        Ok(canonical_path) => ensure_in_workspace(&canonical_base, &canonical_path, rel)?,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            ensure_creatable_path(base, &canonical_base, &abs, rel).await?;
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("canonicalize {}", abs.display()));
+        }
+    }
+    Ok((abs, canonical_base))
+}
+
 pub async fn tree(workspace: &Workspace, rel: &str, depth: u32) -> Result<FileTreeResponse> {
-    let abs = safe_join(&workspace.worktree_path, rel)?;
+    let abs = resolve_existing_path(&workspace.worktree_path, rel).await?;
     let metadata = tokio::fs::metadata(&abs)
         .await
         .with_context(|| format!("stat {}", abs.display()))?;
@@ -96,7 +170,7 @@ async fn walk(start: &Path, base: &Path, max_depth: u32, out: &mut Vec<FileEntry
 }
 
 pub async fn read(workspace: &Workspace, rel: &str) -> Result<FileContent> {
-    let abs = safe_join(&workspace.worktree_path, rel)?;
+    let abs = resolve_existing_path(&workspace.worktree_path, rel).await?;
     let bytes = tokio::fs::read(&abs)
         .await
         .with_context(|| format!("read {}", abs.display()))?;
@@ -115,15 +189,23 @@ pub async fn read(workspace: &Workspace, rel: &str) -> Result<FileContent> {
 }
 
 pub async fn write(workspace: &Workspace, rel: &str, content: &str) -> Result<FileContent> {
-    let abs = safe_join(&workspace.worktree_path, rel)?;
+    let (abs, canonical_base) = resolve_write_path(&workspace.worktree_path, rel).await?;
     if let Some(parent) = abs.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .with_context(|| format!("create_dir_all {}", parent.display()))?;
+        let canonical_parent = tokio::fs::canonicalize(parent)
+            .await
+            .with_context(|| format!("canonicalize {}", parent.display()))?;
+        ensure_in_workspace(&canonical_base, &canonical_parent, rel)?;
     }
     tokio::fs::write(&abs, content)
         .await
         .with_context(|| format!("write {}", abs.display()))?;
+    let canonical_path = tokio::fs::canonicalize(&abs)
+        .await
+        .with_context(|| format!("canonicalize {}", abs.display()))?;
+    ensure_in_workspace(&canonical_base, &canonical_path, rel)?;
     Ok(FileContent {
         workspace_id: workspace.id.clone(),
         path: rel.to_string(),
@@ -210,6 +292,35 @@ mod tests {
         assert!(paths5.contains(&"a/b/c/deep.txt".to_string()));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tree_reports_symlinks_without_recursing() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(tmp.path().join("target"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("target/nested.txt"), "secret")
+            .await
+            .unwrap();
+        symlink("target", tmp.path().join("link")).unwrap();
+
+        let resp = tree(&ws, "", 5).await.unwrap();
+        let link = resp.entries.iter().find(|e| e.path == "link").unwrap();
+        assert_eq!(link.kind, FileKind::Symlink);
+        assert!(!resp.entries.iter().any(|e| e.path == "link/nested.txt"));
+
+        let link_resp = tree(&ws, "link", 5).await.unwrap();
+        assert!(
+            link_resp
+                .entries
+                .iter()
+                .any(|e| e.path == "link/nested.txt")
+        );
+    }
+
     #[tokio::test]
     async fn read_and_write_roundtrip() {
         let tmp = TempDir::new().unwrap();
@@ -222,6 +333,38 @@ mod tests {
 
         let read_back = read(&ws, "src/foo.rs").await.unwrap();
         assert_eq!(read_back.content, "fn foo(){}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        symlink("/etc/passwd", tmp.path().join("secret")).unwrap();
+
+        let err = read(&ws, "secret").await.unwrap_err();
+        assert!(err.to_string().contains("escapes workspace"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_allows_symlink_to_workspace_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(tmp.path().join("target"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("target/inside.txt"), "ok")
+            .await
+            .unwrap();
+        symlink("target", tmp.path().join("link")).unwrap();
+
+        let content = read(&ws, "link/inside.txt").await.unwrap();
+        assert_eq!(content.content, "ok");
     }
 
     #[tokio::test]
@@ -241,5 +384,43 @@ mod tests {
         let ws = fake_workspace(tmp.path().to_path_buf());
         let err = write(&ws, "../escape.txt", "x").await.unwrap_err();
         assert!(err.to_string().contains("escapes workspace"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        tokio::fs::write(&outside_file, "original").await.unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        symlink(&outside_file, tmp.path().join("secret")).unwrap();
+
+        let err = write(&ws, "secret", "changed").await.unwrap_err();
+        assert!(err.to_string().contains("escapes workspace"));
+        let outside_content = tokio::fs::read_to_string(&outside_file).await.unwrap();
+        assert_eq!(outside_content, "original");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_allows_new_file_through_symlink_to_workspace_path() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        tokio::fs::create_dir_all(tmp.path().join("target"))
+            .await
+            .unwrap();
+        symlink("target", tmp.path().join("link")).unwrap();
+
+        let written = write(&ws, "link/new.txt", "ok").await.unwrap();
+        assert_eq!(written.path, "link/new.txt");
+        let content = tokio::fs::read_to_string(tmp.path().join("target/new.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "ok");
     }
 }
