@@ -16,9 +16,11 @@ use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -93,6 +95,22 @@ enum DaemonCmd {
         #[arg(long, default_value = "http://127.0.0.1:18789")]
         endpoint: String,
     },
+}
+
+struct NyxidToken {
+    inner: Zeroizing<String>,
+}
+
+impl NyxidToken {
+    fn new(token: String) -> Self {
+        Self {
+            inner: Zeroizing::new(token),
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        self.inner.as_str()
+    }
 }
 
 #[tokio::main]
@@ -278,12 +296,8 @@ async fn ws_handshake_probe(ws_url: &str) -> Result<NyxIdentity> {
     let mut req = ws_url
         .into_client_request()
         .with_context(|| format!("invalid ws url {ws_url}"))?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {token}")
-            .parse()
-            .context("Bearer header parse")?,
-    );
+    req.headers_mut()
+        .insert("Authorization", bearer_header_value(&token)?);
     let (mut socket, _resp) = connect_async(req)
         .await
         .with_context(|| format!("WS connect {ws_url}"))?;
@@ -425,12 +439,8 @@ async fn probe_terminal(base_url: &str, slug: &str, project_root: &Path) -> Resu
         .as_str()
         .into_client_request()
         .with_context(|| format!("invalid ws url {ws_url}"))?;
-    req.headers_mut().insert(
-        "Authorization",
-        format!("Bearer {token}")
-            .parse()
-            .context("Bearer header parse")?,
-    );
+    req.headers_mut()
+        .insert("Authorization", bearer_header_value(&token)?);
     let (mut socket, _) = connect_async(req)
         .await
         .with_context(|| format!("WS connect {ws_url}"))?;
@@ -639,7 +649,7 @@ async fn e2e_whoami(url: &str) -> Result<NyxIdentity> {
     let token = read_nyxid_token().context("read NyxID access token")?;
     let resp = reqwest::Client::new()
         .get(url)
-        .bearer_auth(&token)
+        .bearer_auth(token.as_str())
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -653,15 +663,103 @@ async fn e2e_whoami(url: &str) -> Result<NyxIdentity> {
     Ok(parsed.identity)
 }
 
-fn read_nyxid_token() -> Result<String> {
+fn bearer_header_value(token: &NyxidToken) -> Result<HeaderValue> {
+    let mut value = Zeroizing::new(String::with_capacity(
+        "Bearer ".len() + token.as_str().len(),
+    ));
+    value.push_str("Bearer ");
+    value.push_str(token.as_str());
+    value.as_str().parse().context("Bearer header parse")
+}
+
+fn read_nyxid_token() -> Result<NyxidToken> {
     let home = std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME env var not set"))?;
-    let path = PathBuf::from(home).join(".nyxid").join("access_token");
-    let raw = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(raw.trim().to_string())
+    read_nyxid_token_from_home(&PathBuf::from(home))
+}
+
+fn read_nyxid_token_from_home(home: &Path) -> Result<NyxidToken> {
+    let path = home.join(".nyxid").join("access_token");
+    read_nyxid_token_from_path(&path)
+}
+
+fn read_nyxid_token_from_path(path: &Path) -> Result<NyxidToken> {
+    ensure_private_token_file(path)?;
+    let raw = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(NyxidToken::new(raw.trim().to_string()))
+}
+
+#[cfg(unix)]
+fn ensure_private_token_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        bail!(
+            "refusing to read {} because permissions {:03o} allow group/other access; run `chmod 0600 {}`",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_private_token_file(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("warn,charon_cli=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    fn write_token_with_mode(home: &Path, mode: u32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nyxid_dir = home.join(".nyxid");
+        std::fs::create_dir_all(&nyxid_dir).expect("create .nyxid");
+        let token_path = nyxid_dir.join("access_token");
+        std::fs::write(&token_path, "secret-token\n").expect("write access_token");
+        let mut permissions = std::fs::metadata(&token_path)
+            .expect("stat access_token")
+            .permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(&token_path, permissions).expect("chmod access_token");
+        token_path
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_nyxid_token_rejects_group_or_world_accessible_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_token_with_mode(home.path(), 0o644);
+
+        let err = match read_nyxid_token_from_home(home.path()) {
+            Ok(_) => panic!("expected insecure token file to be rejected"),
+            Err(err) => err,
+        };
+        let message = format!("{err:#}");
+
+        assert!(message.contains("allow group/other access"));
+        assert!(message.contains("chmod 0600"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn read_nyxid_token_accepts_owner_only_file() {
+        let home = tempfile::tempdir().expect("tempdir");
+        write_token_with_mode(home.path(), 0o600);
+
+        let token = read_nyxid_token_from_home(home.path()).expect("read token");
+
+        assert_eq!(token.as_str(), "secret-token");
+    }
 }
