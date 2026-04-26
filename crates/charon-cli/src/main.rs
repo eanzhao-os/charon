@@ -650,7 +650,7 @@ async fn e2e_whoami(url: &str) -> Result<NyxIdentity> {
     let token = read_nyxid_token().context("read NyxID access token")?;
     let resp = reqwest::Client::new()
         .get(url)
-        .bearer_auth(token.as_str())
+        .header(reqwest::header::AUTHORIZATION, bearer_header_value(&token)?)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -762,5 +762,25 @@ mod tests {
         let token = read_nyxid_token_from_home(home.path()).expect("read token");
 
         assert_eq!(token.as_str(), "secret-token");
+    }
+
+    #[test]
+    fn reqwest_authorization_header_uses_bearer_header_value() {
+        let token = NyxidToken::new("secret-token".to_string());
+        let request = reqwest::Client::new()
+            .get("http://127.0.0.1/whoami")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                bearer_header_value(&token).expect("bearer header"),
+            )
+            .build()
+            .expect("build request");
+
+        let authorization = request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .expect("authorization header");
+
+        assert_eq!(authorization, "Bearer secret-token");
     }
 }
