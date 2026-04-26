@@ -372,6 +372,21 @@ where
     }
 }
 
+fn reject(
+    status: StatusCode,
+    code: &'static str,
+    err: JwtError,
+) -> (StatusCode, Json<crate::ErrorBody>) {
+    warn!(error = %err, "rejecting request");
+    (
+        status,
+        Json(crate::ErrorBody {
+            error: code,
+            message: err.to_string(),
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,7 +491,7 @@ acIKunZfdeu3s95nsCD3HfSe
 
         fn advance(&self, duration: Duration) {
             let mut now = self.now.lock().unwrap();
-            *now = *now + duration;
+            *now += duration;
         }
     }
 
@@ -685,19 +700,4 @@ acIKunZfdeu3s95nsCD3HfSe
             Err(JwtError::MissingKid)
         ));
     }
-}
-
-fn reject(
-    status: StatusCode,
-    code: &'static str,
-    err: JwtError,
-) -> (StatusCode, Json<crate::ErrorBody>) {
-    warn!(error = %err, "rejecting request");
-    (
-        status,
-        Json(crate::ErrorBody {
-            error: code,
-            message: err.to_string(),
-        }),
-    )
 }
