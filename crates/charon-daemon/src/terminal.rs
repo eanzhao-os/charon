@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
@@ -35,6 +36,7 @@ use uuid::Uuid;
 const DEFAULT_SCROLLBACK_BYTES: usize = 1024 * 1024; // 1 MiB
 const PTY_READ_CHUNK: usize = 4096;
 const BROADCAST_CAPACITY: usize = 1024;
+const CHILD_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const FIXED_TERM: &str = "xterm-256color";
 
 #[derive(Debug, Clone)]
@@ -150,12 +152,15 @@ impl TerminalManager {
             reader_loop(reader, handle_for_reader, events_tx, id_for_reader);
         });
 
-        // Waiter: blocking thread, marks status + emits Exited when child dies.
+        // Waiter: async poller, marks status + emits Exited when child dies.
+        // It uses nonblocking try_wait so a stuck PTY child cannot pin a
+        // spawn_blocking worker; Terminal.Kill sends the signal, and the
+        // poller either reaps the child later or stays parked on a timer.
         let events_tx = self.events_tx.clone();
         let handle_for_waiter = handle.clone();
         let id_for_waiter = id.clone();
-        tokio::task::spawn_blocking(move || {
-            waiter_loop(handle_for_waiter, events_tx, id_for_waiter);
+        tokio::spawn(async move {
+            waiter_loop(handle_for_waiter, events_tx, id_for_waiter).await;
         });
 
         info!(
@@ -343,28 +348,43 @@ fn reader_loop(
     }
 }
 
-fn waiter_loop(
+enum ChildWaitPoll {
+    Pending,
+    Exited(Option<i32>),
+}
+
+fn poll_child_exit(handle: &TerminalHandle, terminal_id: &str) -> ChildWaitPoll {
+    let mut child_slot = handle.child.lock().unwrap();
+    match child_slot.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(Some(status)) => {
+                *child_slot = None;
+                ChildWaitPoll::Exited(Some(status.exit_code() as i32))
+            }
+            Ok(None) => ChildWaitPoll::Pending,
+            Err(e) => {
+                warn!(?e, terminal_id, "child wait failed");
+                *child_slot = None;
+                ChildWaitPoll::Exited(None)
+            }
+        },
+        None => {
+            warn!(terminal_id, "child handle already released before wait");
+            ChildWaitPoll::Exited(None)
+        }
+    }
+}
+
+async fn waiter_loop(
     handle: Arc<TerminalHandle>,
     events_tx: broadcast::Sender<TerminalEvent>,
     terminal_id: String,
 ) {
-    let exit_code: Option<i32> = {
-        let mut child = handle.child.lock().unwrap();
-        let exit_code = match child.as_mut() {
-            Some(child) => match child.wait() {
-                Ok(status) => Some(status.exit_code() as i32),
-                Err(e) => {
-                    warn!(?e, terminal_id, "child wait failed");
-                    None
-                }
-            },
-            None => {
-                warn!(terminal_id, "child handle already released before wait");
-                None
-            }
+    let exit_code = loop {
+        match poll_child_exit(&handle, &terminal_id) {
+            ChildWaitPoll::Pending => tokio::time::sleep(CHILD_WAIT_POLL_INTERVAL).await,
+            ChildWaitPoll::Exited(exit_code) => break exit_code,
         };
-        *child = None;
-        exit_code
     };
     *handle.writer.lock().unwrap() = None;
     *handle.master.lock().unwrap() = None;
@@ -510,6 +530,51 @@ mod tests {
         wait_for_exit(&mut events, &terminal.id).await;
         manager.remove(&terminal.id).await.unwrap();
         assert!(manager.list(Some(&workspace.id)).await.is_empty());
+    }
+
+    #[test]
+    fn running_terminal_waiter_does_not_pin_spawn_blocking_worker() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(2)
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let workspace = fake_workspace(tmp.path().to_path_buf());
+            let manager = TerminalManager::new();
+            let mut events = manager.subscribe();
+            let cat_cmd = first_existing(&["/bin/cat", "/usr/bin/cat"], "cat");
+
+            let terminal = manager
+                .create(
+                    &workspace,
+                    CreateTerminalPayload {
+                        workspace_id: workspace.id.clone(),
+                        command: Some(cat_cmd),
+                        env: HashMap::new(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .await
+                .unwrap();
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                tokio::task::spawn_blocking(|| "blocking worker is available"),
+            )
+            .await
+            .expect("unrelated spawn_blocking task was starved by terminal waiter")
+            .expect("spawn_blocking task panicked");
+
+            manager.kill(&terminal.id).await.unwrap();
+            wait_for_exit(&mut events, &terminal.id).await;
+            manager.remove(&terminal.id).await.unwrap();
+        });
     }
 
     // ---- env allowlist tests (unix-only because they need /usr/bin/env + signal-safe set_var) ----
