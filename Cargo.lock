@@ -267,6 +267,7 @@ dependencies = [
  "jsonwebtoken",
  "portable-pty",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
