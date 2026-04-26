@@ -2,8 +2,8 @@
 //!
 //! All paths are sandboxed via lexical normalization (`..` traversal beyond
 //! workspace root is rejected, absolute paths are rejected). Read/write opens
-//! are performed relative to a held workspace-root fd without following
-//! symlinks, so the final syscall cannot race against a symlink swap.
+//! are performed relative to a held workspace-root fd with beneath-root
+//! enforcement, so the final syscall cannot race against a symlink swap.
 //!
 //! M2.3 ships UTF-8 only — non-UTF-8 read/write returns a clear error pointing
 //! at M2.4 when binary attachment plumbing lands with terminals.
@@ -11,12 +11,16 @@
 use std::collections::VecDeque;
 #[cfg(not(unix))]
 use std::io::ErrorKind;
+#[cfg(all(unix, not(target_os = "linux")))]
+use std::os::unix::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf};
 #[cfg(unix)]
 use std::{ffi::OsString, fs::File, io::Read, io::Write};
 
 use anyhow::{Context, Result, anyhow, bail};
 use charon_core::{FileContent, FileEntry, FileKind, FileTreeResponse, Workspace};
+#[cfg(all(unix, not(target_os = "linux")))]
+use rustix::fs::{AtFlags, FileType, readlinkat, statat};
 #[cfg(target_os = "linux")]
 use rustix::fs::{ResolveFlags, openat2};
 #[cfg(unix)]
@@ -179,11 +183,20 @@ fn dir_open_flags() -> OFlags {
 
 #[cfg(unix)]
 fn secure_path_error(err: Errno, rel: &str, action: String) -> anyhow::Error {
-    if err == Errno::LOOP || err == Errno::NOTDIR {
-        anyhow!("path '{}' escapes workspace or contains symlink", rel)
+    if err == Errno::LOOP || err == Errno::NOTDIR || err == Errno::XDEV {
+        anyhow!("path '{}' escapes workspace", rel)
     } else {
         anyhow::Error::new(std::io::Error::from(err)).context(action)
     }
+}
+
+#[cfg(unix)]
+fn error_is_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    })
 }
 
 #[cfg(unix)]
@@ -260,16 +273,161 @@ fn ensure_parent_dirs_no_symlinks(
     Ok(())
 }
 
-#[cfg(unix)]
-fn open_parent_dir(root: &OwnedFd, components: &[OsString], rel: &str) -> Result<Option<OwnedFd>> {
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_dir_components(
+    root: &OwnedFd,
+    components: &[OsString],
+    rel: &str,
+) -> Result<Option<OwnedFd>> {
     let mut current: Option<OwnedFd> = None;
-    for component in components.iter().take(components.len().saturating_sub(1)) {
+    for component in components {
         let parent = current
             .as_ref()
             .map_or_else(|| root.as_fd(), |fd| fd.as_fd());
         current = Some(open_dir_component(parent, component, rel)?);
     }
     Ok(current)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_parent_dir(root: &OwnedFd, components: &[OsString], rel: &str) -> Result<Option<OwnedFd>> {
+    open_dir_components(root, &components[..components.len().saturating_sub(1)], rel)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn components_to_path(components: &[OsString]) -> PathBuf {
+    let mut path = PathBuf::new();
+    for component in components {
+        path.push(component);
+    }
+    path
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn append_relative_components(
+    components: &mut Vec<OsString>,
+    path: &Path,
+    rel: &str,
+) -> Result<()> {
+    for component in path.components() {
+        match component {
+            Component::Normal(s) => components.push(s.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if components.pop().is_none() {
+                    bail!("path '{}' escapes workspace", rel);
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("path '{}' escapes workspace", rel);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn absolute_target_components(base: &Path, target: &Path, rel: &str) -> Result<Vec<OsString>> {
+    let mut normalized = PathBuf::from("/");
+    for component in target.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(s) => normalized.push(s),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    bail!("path '{}' escapes workspace", rel);
+                }
+            }
+            Component::Prefix(_) => bail!("path '{}' escapes workspace", rel),
+        }
+    }
+
+    let canonical_base = std::fs::canonicalize(base)
+        .with_context(|| format!("canonicalize workspace {}", base.display()))?;
+    let relative = normalized
+        .strip_prefix(&canonical_base)
+        .map_err(|_| anyhow!("path '{}' escapes workspace", rel))?;
+    let mut components = Vec::new();
+    append_relative_components(&mut components, relative, rel)?;
+    Ok(components)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn resolve_symlinks_for_open(
+    base: &Path,
+    root: &OwnedFd,
+    rel_path: &SecureRelPath,
+    rel: &str,
+    allow_missing_final: bool,
+) -> Result<SecureRelPath> {
+    let mut pending: VecDeque<OsString> = rel_path.components.iter().cloned().collect();
+    let mut resolved = Vec::new();
+    let mut symlinks_seen = 0usize;
+
+    while let Some(component) = pending.pop_front() {
+        let parent = open_dir_components(root, &resolved, rel)?;
+        let parent = parent
+            .as_ref()
+            .map_or_else(|| root.as_fd(), |fd| fd.as_fd());
+
+        let stat = match statat(
+            parent,
+            component_path(&component),
+            AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(stat) => stat,
+            Err(Errno::NOENT) if allow_missing_final && pending.is_empty() => {
+                resolved.push(component);
+                break;
+            }
+            Err(err) => {
+                return Err(secure_path_error(
+                    err,
+                    rel,
+                    format!("stat {}", component_path(&component).display()),
+                ));
+            }
+        };
+
+        if FileType::from_raw_mode(stat.st_mode).is_symlink() {
+            symlinks_seen += 1;
+            if symlinks_seen > 40 {
+                bail!("path '{}' has too many symlinks", rel);
+            }
+
+            let target =
+                readlinkat(parent, component_path(&component), Vec::new()).map_err(|err| {
+                    secure_path_error(
+                        err,
+                        rel,
+                        format!("readlink {}", component_path(&component).display()),
+                    )
+                })?;
+            let target = PathBuf::from(OsString::from_vec(target.into_bytes()));
+            let mut replacement = if target.is_absolute() {
+                absolute_target_components(base, &target, rel)?
+            } else {
+                let mut replacement = resolved.clone();
+                append_relative_components(&mut replacement, &target, rel)?;
+                replacement
+            };
+            replacement.extend(pending);
+            pending = replacement.into();
+            resolved.clear();
+        } else {
+            resolved.push(component);
+        }
+    }
+
+    if resolved.is_empty() {
+        bail!("path '{}' must name a file", rel);
+    }
+
+    Ok(SecureRelPath {
+        path: components_to_path(&resolved),
+        components: resolved,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -279,13 +437,19 @@ fn open_read_no_symlinks(root: &OwnedFd, rel_path: &SecureRelPath, rel: &str) ->
         &rel_path.path,
         OFlags::RDONLY | OFlags::CLOEXEC,
         Mode::empty(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+        ResolveFlags::BENEATH,
     )
     .map_err(|err| secure_path_error(err, rel, format!("open {}", rel_path.path.display())))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn open_read_no_symlinks(root: &OwnedFd, rel_path: &SecureRelPath, rel: &str) -> Result<OwnedFd> {
+fn open_read_no_symlinks(
+    base: &Path,
+    root: &OwnedFd,
+    rel_path: &SecureRelPath,
+    rel: &str,
+) -> Result<OwnedFd> {
+    let rel_path = resolve_symlinks_for_open(base, root, rel_path, rel, false)?;
     let parent = open_parent_dir(root, &rel_path.components, rel)?;
     let parent = parent
         .as_ref()
@@ -307,13 +471,19 @@ fn open_write_no_symlinks(root: &OwnedFd, rel_path: &SecureRelPath, rel: &str) -
         &rel_path.path,
         OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
         file_mode(),
-        ResolveFlags::NO_SYMLINKS | ResolveFlags::BENEATH,
+        ResolveFlags::BENEATH,
     )
     .map_err(|err| secure_path_error(err, rel, format!("open {}", rel_path.path.display())))
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn open_write_no_symlinks(root: &OwnedFd, rel_path: &SecureRelPath, rel: &str) -> Result<OwnedFd> {
+fn open_write_no_symlinks(
+    base: &Path,
+    root: &OwnedFd,
+    rel_path: &SecureRelPath,
+    rel: &str,
+) -> Result<OwnedFd> {
+    let rel_path = resolve_symlinks_for_open(base, root, rel_path, rel, true)?;
     let parent = open_parent_dir(root, &rel_path.components, rel)?;
     let parent = parent
         .as_ref()
@@ -335,7 +505,10 @@ fn read_file_no_symlinks_blocking(
     rel: &str,
 ) -> Result<Vec<u8>> {
     let root = open_workspace_root(base)?;
+    #[cfg(target_os = "linux")]
     let fd = open_read_no_symlinks(&root, &rel_path, rel)?;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let fd = open_read_no_symlinks(base, &root, &rel_path, rel)?;
     let mut file = File::from(fd);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -365,9 +538,27 @@ where
     F: FnOnce(),
 {
     let root = open_workspace_root(base)?;
-    ensure_parent_dirs_no_symlinks(&root, &rel_path.components, rel)?;
     before_open();
-    let fd = open_write_no_symlinks(&root, &rel_path, rel)?;
+    #[cfg(target_os = "linux")]
+    let opened = open_write_no_symlinks(&root, &rel_path, rel);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let opened = open_write_no_symlinks(base, &root, &rel_path, rel);
+
+    let fd = match opened {
+        Ok(fd) => fd,
+        Err(err) if error_is_not_found(&err) => {
+            ensure_parent_dirs_no_symlinks(&root, &rel_path.components, rel)?;
+            #[cfg(target_os = "linux")]
+            {
+                open_write_no_symlinks(&root, &rel_path, rel)?
+            }
+            #[cfg(all(unix, not(target_os = "linux")))]
+            {
+                open_write_no_symlinks(base, &root, &rel_path, rel)?
+            }
+        }
+        Err(err) => return Err(err),
+    };
     let mut file = File::from(fd);
     file.write_all(content.as_bytes())
         .with_context(|| format!("write {}", rel_path.path.display()))?;
@@ -653,7 +844,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn read_rejects_symlink_to_workspace_path() {
+    async fn read_allows_symlink_to_workspace_path() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
@@ -666,8 +857,8 @@ mod tests {
             .unwrap();
         symlink("target", tmp.path().join("link")).unwrap();
 
-        let err = read(&ws, "link/inside.txt").await.unwrap_err();
-        assert!(err.to_string().contains("escapes workspace"));
+        let content = read(&ws, "link/inside.txt").await.unwrap();
+        assert_eq!(content.content, "ok");
     }
 
     #[tokio::test]
@@ -709,7 +900,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn write_rejects_symlink_to_workspace_path() {
+    async fn write_allows_new_file_through_symlink_to_workspace_path() {
         use std::os::unix::fs::symlink;
 
         let tmp = TempDir::new().unwrap();
@@ -719,9 +910,47 @@ mod tests {
             .unwrap();
         symlink("target", tmp.path().join("link")).unwrap();
 
-        let err = write(&ws, "link/new.txt", "ok").await.unwrap_err();
+        let written = write(&ws, "link/new.txt", "ok").await.unwrap();
+        assert_eq!(written.path, "link/new.txt");
+        let content = tokio::fs::read_to_string(tmp.path().join("target/new.txt"))
+            .await
+            .unwrap();
+        assert_eq!(content, "ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_symlink_to_outside_directory() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        tokio::fs::write(outside.path().join("secret.txt"), "secret")
+            .await
+            .unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        symlink(outside.path(), tmp.path().join("link")).unwrap();
+
+        let err = read(&ws, "link/secret.txt").await.unwrap_err();
         assert!(err.to_string().contains("escapes workspace"));
-        assert!(!tmp.path().join("target/new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_rejects_symlink_to_outside_directory_without_touching_outside() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        tokio::fs::write(&outside_file, "original").await.unwrap();
+        let ws = fake_workspace(tmp.path().to_path_buf());
+        symlink(outside.path(), tmp.path().join("link")).unwrap();
+
+        let err = write(&ws, "link/secret.txt", "changed").await.unwrap_err();
+        assert!(err.to_string().contains("escapes workspace"));
+        let outside_content = tokio::fs::read_to_string(&outside_file).await.unwrap();
+        assert_eq!(outside_content, "original");
     }
 
     #[cfg(unix)]
