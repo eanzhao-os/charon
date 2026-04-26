@@ -266,6 +266,7 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
