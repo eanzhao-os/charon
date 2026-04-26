@@ -27,7 +27,7 @@ use charon_core::{
     TerminalStatus, Workspace,
 };
 use chrono::Utc;
-use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::{RwLock, broadcast};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -56,9 +56,10 @@ pub struct TerminalManager {
 
 struct TerminalHandle {
     info: std::sync::Mutex<Terminal>,
-    master: std::sync::Mutex<Box<dyn MasterPty + Send>>,
-    writer: std::sync::Mutex<Box<dyn Write + Send>>,
-    child: std::sync::Mutex<Box<dyn portable_pty::Child + Send + Sync>>,
+    master: std::sync::Mutex<Option<Box<dyn MasterPty + Send>>>,
+    writer: std::sync::Mutex<Option<Box<dyn Write + Send>>>,
+    child: std::sync::Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    killer: std::sync::Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     scrollback: std::sync::Mutex<VecDeque<u8>>,
     next_seq: AtomicU64,
 }
@@ -112,6 +113,7 @@ impl TerminalManager {
             .slave
             .spawn_command(cmd)
             .context("spawn command in PTY slave")?;
+        let killer = child.clone_killer();
         // Drop our slave handle so master EOFs cleanly when the child exits.
         drop(pair.slave);
 
@@ -132,9 +134,10 @@ impl TerminalManager {
 
         let handle = Arc::new(TerminalHandle {
             info: std::sync::Mutex::new(info.clone()),
-            master: std::sync::Mutex::new(pair.master),
-            writer: std::sync::Mutex::new(writer),
-            child: std::sync::Mutex::new(child),
+            master: std::sync::Mutex::new(Some(pair.master)),
+            writer: std::sync::Mutex::new(Some(writer)),
+            child: std::sync::Mutex::new(Some(child)),
+            killer: std::sync::Mutex::new(Some(killer)),
             scrollback: std::sync::Mutex::new(VecDeque::new()),
             next_seq: AtomicU64::new(0),
         });
@@ -189,9 +192,13 @@ impl TerminalManager {
 
     pub async fn send_keys(&self, terminal_id: &str, data: Vec<u8>) -> Result<usize> {
         let handle = self.get_handle(terminal_id).await?;
+        let terminal_id = terminal_id.to_string();
         let n = data.len();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut writer = handle.writer.lock().unwrap();
+            let writer = writer
+                .as_mut()
+                .ok_or_else(|| anyhow!("terminal {terminal_id} has exited"))?;
             writer.write_all(&data).context("PTY write")?;
             writer.flush().ok();
             Ok(())
@@ -203,8 +210,12 @@ impl TerminalManager {
 
     pub async fn resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<()> {
         let handle = self.get_handle(terminal_id).await?;
+        let terminal_id = terminal_id.to_string();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let master = handle.master.lock().unwrap();
+            let master = master
+                .as_ref()
+                .ok_or_else(|| anyhow!("terminal {terminal_id} has exited"))?;
             master
                 .resize(PtySize {
                     rows,
@@ -225,13 +236,32 @@ impl TerminalManager {
 
     pub async fn kill(&self, terminal_id: &str) -> Result<()> {
         let handle = self.get_handle(terminal_id).await?;
-        tokio::task::spawn_blocking(move || {
-            let mut child = handle.child.lock().unwrap();
-            let _ = child.kill();
+        let terminal_id = terminal_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut killer = handle.killer.lock().unwrap();
+            let killer = killer
+                .as_mut()
+                .ok_or_else(|| anyhow!("terminal {terminal_id} has exited"))?;
+            killer.kill().context("PTY child kill")?;
+            Ok(())
         })
         .await
-        .context("spawn_blocking kill")?;
+        .context("spawn_blocking kill")??;
         Ok(())
+    }
+
+    pub async fn remove(&self, terminal_id: &str) -> Result<Terminal> {
+        let mut map = self.inner.write().await;
+        let handle = map
+            .get(terminal_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("terminal {terminal_id} not found"))?;
+        let info = handle.info.lock().unwrap().clone();
+        if info.status == TerminalStatus::Running {
+            return Err(anyhow!("terminal {terminal_id} is still running"));
+        }
+        map.remove(terminal_id);
+        Ok(info)
     }
 
     pub async fn scrollback(&self, terminal_id: &str) -> Result<TerminalScrollbackResponse> {
@@ -301,14 +331,25 @@ fn waiter_loop(
 ) {
     let exit_code: Option<i32> = {
         let mut child = handle.child.lock().unwrap();
-        match child.wait() {
-            Ok(status) => Some(status.exit_code() as i32),
-            Err(e) => {
-                warn!(?e, terminal_id, "child wait failed");
+        let exit_code = match child.as_mut() {
+            Some(child) => match child.wait() {
+                Ok(status) => Some(status.exit_code() as i32),
+                Err(e) => {
+                    warn!(?e, terminal_id, "child wait failed");
+                    None
+                }
+            },
+            None => {
+                warn!(terminal_id, "child handle already released before wait");
                 None
             }
-        }
+        };
+        *child = None;
+        exit_code
     };
+    *handle.writer.lock().unwrap() = None;
+    *handle.master.lock().unwrap() = None;
+    *handle.killer.lock().unwrap() = None;
     {
         let mut info = handle.info.lock().unwrap();
         info.status = TerminalStatus::Exited;
@@ -320,4 +361,139 @@ fn waiter_loop(
         exit_code,
     });
     info!(terminal_id, ?exit_code, "terminal exited");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::time::Duration;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn test_workspace(tmp: &TempDir) -> Workspace {
+        Workspace {
+            id: "ws-test".to_string(),
+            title: None,
+            project_root: tmp.path().to_path_buf(),
+            base_branch: "main".to_string(),
+            branch: "test".to_string(),
+            worktree_path: tmp.path().to_path_buf(),
+            created_at: Utc::now(),
+            archived_at: None,
+        }
+    }
+
+    fn command(candidates: &[&str], fallback: &str) -> String {
+        candidates
+            .iter()
+            .find(|candidate| Path::new(candidate).exists())
+            .copied()
+            .unwrap_or(fallback)
+            .to_string()
+    }
+
+    async fn wait_for_exit(
+        events: &mut broadcast::Receiver<TerminalEvent>,
+        terminal_id: &str,
+    ) -> Option<i32> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!("timed out waiting for terminal {terminal_id} exit");
+            }
+            match tokio::time::timeout(remaining, events.recv()).await {
+                Ok(Ok(TerminalEvent::Exited {
+                    terminal_id: id,
+                    exit_code,
+                })) if id == terminal_id => return exit_code,
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => panic!("terminal event channel failed: {e}"),
+                Err(_) => panic!("timed out waiting for terminal {terminal_id} exit"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn exited_terminals_release_pty_resources_and_can_be_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = test_workspace(&tmp);
+        let manager = TerminalManager::new();
+        let mut events = manager.subscribe();
+        let true_cmd = command(&["/usr/bin/true", "/bin/true"], "true");
+        let mut terminal_ids = Vec::new();
+
+        for _ in 0..10 {
+            let terminal = manager
+                .create(
+                    &workspace,
+                    CreateTerminalPayload {
+                        workspace_id: workspace.id.clone(),
+                        command: Some(true_cmd.clone()),
+                        cols: 80,
+                        rows: 24,
+                    },
+                )
+                .await
+                .unwrap();
+            terminal_ids.push(terminal.id);
+        }
+
+        for terminal_id in &terminal_ids {
+            wait_for_exit(&mut events, terminal_id).await;
+        }
+
+        let listed = manager.list(Some(&workspace.id)).await;
+        assert_eq!(listed.len(), terminal_ids.len());
+        assert!(
+            listed
+                .iter()
+                .all(|terminal| terminal.status == TerminalStatus::Exited)
+        );
+
+        for terminal_id in &terminal_ids {
+            let handle = manager.get_handle(terminal_id).await.unwrap();
+            assert!(handle.master.lock().unwrap().is_none());
+            assert!(handle.writer.lock().unwrap().is_none());
+            assert!(handle.child.lock().unwrap().is_none());
+            assert!(handle.killer.lock().unwrap().is_none());
+
+            let removed = manager.remove(terminal_id).await.unwrap();
+            assert_eq!(removed.status, TerminalStatus::Exited);
+        }
+
+        assert!(manager.list(Some(&workspace.id)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remove_refuses_running_terminals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = test_workspace(&tmp);
+        let manager = TerminalManager::new();
+        let mut events = manager.subscribe();
+        let cat_cmd = command(&["/bin/cat", "/usr/bin/cat"], "cat");
+
+        let terminal = manager
+            .create(
+                &workspace,
+                CreateTerminalPayload {
+                    workspace_id: workspace.id.clone(),
+                    command: Some(cat_cmd),
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await
+            .unwrap();
+
+        let err = manager.remove(&terminal.id).await.unwrap_err();
+        assert!(err.to_string().contains("still running"));
+
+        manager.kill(&terminal.id).await.unwrap();
+        wait_for_exit(&mut events, &terminal.id).await;
+        manager.remove(&terminal.id).await.unwrap();
+        assert!(manager.list(Some(&workspace.id)).await.is_empty());
+    }
 }

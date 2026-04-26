@@ -145,6 +145,11 @@ pub enum ClientFrame {
         id: String,
         payload: TerminalIdPayload,
     },
+    #[serde(rename = "Terminal.Remove")]
+    TerminalRemove {
+        id: String,
+        payload: TerminalIdPayload,
+    },
     #[serde(rename = "Terminal.List")]
     TerminalList {
         id: String,
@@ -196,6 +201,11 @@ pub enum ServerFrame {
     },
     #[serde(rename = "Terminal.Killed")]
     TerminalKilled { id: String, result: TerminalKillAck },
+    #[serde(rename = "Terminal.Removed")]
+    TerminalRemoved {
+        id: String,
+        result: TerminalRemoveAck,
+    },
     #[serde(rename = "Terminal.Listed")]
     TerminalListed {
         id: String,
@@ -403,6 +413,11 @@ pub struct TerminalResizeAck {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalKillAck {
+    pub terminal_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalRemoveAck {
     pub terminal_id: String,
 }
 

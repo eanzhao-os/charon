@@ -15,7 +15,7 @@ use axum::response::Response;
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use charon_core::{
     ClientFrame, DAEMON_VERSION, HelloPayload, ListWorkspacesResponse, NyxIdentity, ServerFrame,
-    ServerInfo, TerminalKeysAck, TerminalKillAck, TerminalResizeAck, WsError,
+    ServerInfo, TerminalKeysAck, TerminalKillAck, TerminalRemoveAck, TerminalResizeAck, WsError,
 };
 use chrono::Utc;
 use tokio::sync::broadcast::error::RecvError;
@@ -347,6 +347,23 @@ async fn dispatch(
                     .await;
                 }
                 Err(e) => send_error(socket, Some(id), "kill_failed", e.to_string()).await,
+            }
+        }
+        ClientFrame::TerminalRemove { id, payload } => {
+            match terminals.remove(&payload.terminal_id).await {
+                Ok(_) => {
+                    send_or_warn(
+                        socket,
+                        &ServerFrame::TerminalRemoved {
+                            id,
+                            result: TerminalRemoveAck {
+                                terminal_id: payload.terminal_id,
+                            },
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => send_error(socket, Some(id), "remove_failed", e.to_string()).await,
             }
         }
         ClientFrame::TerminalList { id, payload } => {
