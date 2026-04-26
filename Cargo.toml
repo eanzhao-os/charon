@@ -52,6 +52,7 @@ base64 = "0.22"
 bytes = "1"
 portable-pty = "0.9"
 zeroize = "1"
+parking_lot = "0.12"
 
 [profile.release]
 lto = "thin"
