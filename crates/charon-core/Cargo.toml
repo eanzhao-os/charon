@@ -9,6 +9,4 @@ description = "Charon shared types: wire protocol, identity, workspace/agent/ter
 
 [dependencies]
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 chrono.workspace = true
