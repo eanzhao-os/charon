@@ -87,7 +87,9 @@ trait AgentClient: Send + Sync {
 
 ### NyxID JWT Verifier
 - 启动时拉取 `/.well-known/openid-configuration` → `jwks_uri` → 公钥
-- 缓存 24h，过期 lazy 刷新
+- 启动 fail-closed：discovery / 初始 JWKS 拉取失败则 daemon 不启动；当前不持久化 last-known-good JWKS
+- JWKS 缓存 24h；TTL 过期后即使 `kid` 已知也先刷新，避免 NyxID 复用 `kid` 轮换 key material 时长期使用旧公钥
+- 未知 `kid` 会触发 lazy refresh；重复未知 `kid` 刷新按 60s 节流
 - 每个进入 daemon 的请求验 `X-NyxID-Identity-Token`，从 claims 取 `sub` (user_id)
 
 ## Wire Protocol (Client ↔ Daemon)
