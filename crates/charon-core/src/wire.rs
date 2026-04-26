@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -427,6 +428,10 @@ pub struct CreateTerminalPayload {
     pub workspace_id: String,
     #[serde(default)]
     pub command: Option<String>,
+    /// Explicit environment variables to forward into the PTY. The daemon's
+    /// ambient environment is filtered separately before these are applied.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
     #[serde(default = "default_cols")]
     pub cols: u16,
     #[serde(default = "default_rows")]

@@ -35,6 +35,7 @@ use uuid::Uuid;
 const DEFAULT_SCROLLBACK_BYTES: usize = 1024 * 1024; // 1 MiB
 const PTY_READ_CHUNK: usize = 4096;
 const BROADCAST_CAPACITY: usize = 1024;
+const FIXED_TERM: &str = "xterm-256color";
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
@@ -104,10 +105,7 @@ impl TerminalManager {
 
         let mut cmd = CommandBuilder::new(&cmd_str);
         cmd.cwd(&workspace.worktree_path);
-        for (k, v) in std::env::vars() {
-            cmd.env(k, v);
-        }
-        cmd.env("TERM", "xterm-256color");
+        populate_terminal_env(&mut cmd, &payload.env);
 
         let child = pair
             .slave
@@ -287,6 +285,27 @@ impl TerminalManager {
     }
 }
 
+/// PTYs should not inherit daemon credentials. Start from an empty environment,
+/// copy only PATH, HOME, USER, SHELL, LANG, and LC_* from the daemon, then add
+/// request-scoped opt-ins.
+fn populate_terminal_env(cmd: &mut CommandBuilder, explicit_env: &HashMap<String, String>) {
+    cmd.env_clear();
+
+    for (key, value) in std::env::vars().filter(|(key, _)| is_allowed_daemon_env(key)) {
+        cmd.env(key, value);
+    }
+
+    for (key, value) in explicit_env {
+        cmd.env(key, value);
+    }
+
+    cmd.env("TERM", FIXED_TERM);
+}
+
+fn is_allowed_daemon_env(key: &str) -> bool {
+    matches!(key, "PATH" | "HOME" | "USER" | "SHELL" | "LANG") || key.starts_with("LC_")
+}
+
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     handle: Arc<TerminalHandle>,
@@ -365,27 +384,27 @@ fn waiter_loop(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-    use std::time::Duration;
-
-    use tempfile::TempDir;
-
     use super::*;
+    use chrono::Utc;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::broadcast::error::RecvError;
 
-    fn test_workspace(tmp: &TempDir) -> Workspace {
+    fn fake_workspace(worktree: PathBuf) -> Workspace {
         Workspace {
             id: "ws-test".to_string(),
             title: None,
-            project_root: tmp.path().to_path_buf(),
+            project_root: worktree.clone(),
             base_branch: "main".to_string(),
             branch: "test".to_string(),
-            worktree_path: tmp.path().to_path_buf(),
+            worktree_path: worktree,
             created_at: Utc::now(),
             archived_at: None,
         }
     }
 
-    fn command(candidates: &[&str], fallback: &str) -> String {
+    fn first_existing(candidates: &[&str], fallback: &str) -> String {
         candidates
             .iter()
             .find(|candidate| Path::new(candidate).exists())
@@ -394,35 +413,29 @@ mod tests {
             .to_string()
     }
 
-    async fn wait_for_exit(
-        events: &mut broadcast::Receiver<TerminalEvent>,
-        terminal_id: &str,
-    ) -> Option<i32> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                panic!("timed out waiting for terminal {terminal_id} exit");
+    async fn wait_for_exit(events: &mut broadcast::Receiver<TerminalEvent>, terminal_id: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Ok(TerminalEvent::Exited {
+                        terminal_id: id, ..
+                    }) if id == terminal_id => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => panic!("terminal event channel closed"),
+                }
             }
-            match tokio::time::timeout(remaining, events.recv()).await {
-                Ok(Ok(TerminalEvent::Exited {
-                    terminal_id: id,
-                    exit_code,
-                })) if id == terminal_id => return exit_code,
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => panic!("terminal event channel failed: {e}"),
-                Err(_) => panic!("timed out waiting for terminal {terminal_id} exit"),
-            }
-        }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for terminal {terminal_id} exit"));
     }
 
     #[tokio::test]
     async fn exited_terminals_release_pty_resources_and_can_be_removed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace = test_workspace(&tmp);
+        let tmp = TempDir::new().unwrap();
+        let workspace = fake_workspace(tmp.path().to_path_buf());
         let manager = TerminalManager::new();
         let mut events = manager.subscribe();
-        let true_cmd = command(&["/usr/bin/true", "/bin/true"], "true");
+        let true_cmd = first_existing(&["/usr/bin/true", "/bin/true"], "true");
         let mut terminal_ids = Vec::new();
 
         for _ in 0..10 {
@@ -432,6 +445,7 @@ mod tests {
                     CreateTerminalPayload {
                         workspace_id: workspace.id.clone(),
                         command: Some(true_cmd.clone()),
+                        env: HashMap::new(),
                         cols: 80,
                         rows: 24,
                     },
@@ -469,11 +483,11 @@ mod tests {
 
     #[tokio::test]
     async fn remove_refuses_running_terminals() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace = test_workspace(&tmp);
+        let tmp = TempDir::new().unwrap();
+        let workspace = fake_workspace(tmp.path().to_path_buf());
         let manager = TerminalManager::new();
         let mut events = manager.subscribe();
-        let cat_cmd = command(&["/bin/cat", "/usr/bin/cat"], "cat");
+        let cat_cmd = first_existing(&["/bin/cat", "/usr/bin/cat"], "cat");
 
         let terminal = manager
             .create(
@@ -481,6 +495,7 @@ mod tests {
                 CreateTerminalPayload {
                     workspace_id: workspace.id.clone(),
                     command: Some(cat_cmd),
+                    env: HashMap::new(),
                     cols: 80,
                     rows: 24,
                 },
@@ -495,5 +510,111 @@ mod tests {
         wait_for_exit(&mut events, &terminal.id).await;
         manager.remove(&terminal.id).await.unwrap();
         assert!(manager.list(Some(&workspace.id)).await.is_empty());
+    }
+
+    // ---- env allowlist tests (unix-only because they need /usr/bin/env + signal-safe set_var) ----
+
+    #[cfg(unix)]
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl EnvVarGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(&self.key, value),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_env_terminal(explicit_env: HashMap<String, String>) -> String {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+        let tmp = TempDir::new().unwrap();
+        let workspace = fake_workspace(tmp.path().to_path_buf());
+        let manager = TerminalManager::new();
+        let mut events = manager.subscribe();
+        let terminal = manager
+            .create(
+                &workspace,
+                CreateTerminalPayload {
+                    workspace_id: workspace.id.clone(),
+                    command: Some("/usr/bin/env".to_string()),
+                    env: explicit_env,
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await
+            .unwrap();
+
+        wait_for_exit(&mut events, &terminal.id).await;
+
+        // Wait for scrollback to settle (PTY may keep emitting briefly after wait()).
+        let mut previous: Vec<u8> = Vec::new();
+        let mut stable = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let response = manager.scrollback(&terminal.id).await.unwrap();
+            let bytes = BASE64.decode(response.data_b64).unwrap();
+            if !bytes.is_empty() && bytes == previous {
+                stable += 1;
+                if stable >= 2 {
+                    return String::from_utf8_lossy(&bytes).into_owned();
+                }
+            } else {
+                previous = bytes;
+                stable = 0;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scrollback did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_filters_daemon_environment() {
+        let _guard = EnvVarGuard::set("FAKE_API_KEY", "secret-from-daemon");
+
+        let output = run_env_terminal(HashMap::new()).await;
+
+        assert!(!output.contains("FAKE_API_KEY"));
+        assert!(!output.contains("secret-from-daemon"));
+        assert!(output.contains("TERM=xterm-256color"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_includes_explicit_environment() {
+        let output = run_env_terminal(HashMap::from([(
+            "CHARON_EXPLICIT_ENV".to_string(),
+            "forwarded".to_string(),
+        )]))
+        .await;
+
+        assert!(output.contains("CHARON_EXPLICIT_ENV=forwarded"));
     }
 }
