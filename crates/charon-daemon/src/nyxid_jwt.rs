@@ -525,9 +525,9 @@ fn reject(
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
+    use parking_lot::Mutex;
     use serde::Serialize;
     use std::collections::VecDeque;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
@@ -625,14 +625,14 @@ acIKunZfdeu3s95nsCD3HfSe
         }
 
         fn advance(&self, duration: Duration) {
-            let mut now = self.now.lock().unwrap();
+            let mut now = self.now.lock();
             *now += duration;
         }
     }
 
     impl Clock for ManualClock {
         fn now(&self) -> Instant {
-            *self.now.lock().unwrap()
+            *self.now.lock()
         }
     }
 
@@ -680,7 +680,6 @@ acIKunZfdeu3s95nsCD3HfSe
                 }
                 self.responses
                     .lock()
-                    .unwrap()
                     .pop_front()
                     .expect("stub JWKS response")
             })
@@ -731,7 +730,6 @@ acIKunZfdeu3s95nsCD3HfSe
                 Ok(self
                     .responses
                     .lock()
-                    .unwrap()
                     .pop_front()
                     .expect("blocking JWKS response"))
             })
