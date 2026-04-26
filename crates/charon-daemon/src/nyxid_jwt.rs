@@ -7,8 +7,8 @@
 //! Runtime cache policy:
 //! - cache materialized keys by `kid` for 24h;
 //! - once the TTL expires, refresh before using even a known `kid`;
-//! - refresh lazily on an unknown `kid`, with a 60s throttle for repeated
-//!   unknown-kid attempts.
+//! - refresh lazily on an unknown `kid`, with a 60s throttle after successful
+//!   unknown-kid refreshes.
 //!
 //! `verify` returns a [`NyxIdentity`] populated from the JWT claims.
 //!
@@ -307,16 +307,9 @@ impl JwksClient {
             cache.jwks_uri.clone()
         };
 
-        match self
-            .refresh_from_uri(&jwks_uri, Some(self.clock.now()))
-            .await
-        {
-            Ok(()) => Ok(true),
-            Err(err) => {
-                self.record_kid_miss_refresh_attempt(self.clock.now()).await;
-                Err(err)
-            }
-        }
+        self.refresh_from_uri(&jwks_uri, Some(self.clock.now()))
+            .await?;
+        Ok(true)
     }
 
     async fn refresh_from_uri(
@@ -334,11 +327,6 @@ impl JwksClient {
         }
         info!(key_count = n, "JWKS refreshed");
         Ok(())
-    }
-
-    async fn record_kid_miss_refresh_attempt(&self, attempted_at: Instant) {
-        let mut cache = self.inner.write().await;
-        cache.last_kid_miss_refresh_at = Some(attempted_at);
     }
 
     #[cfg(test)]
@@ -649,7 +637,7 @@ acIKunZfdeu3s95nsCD3HfSe
     }
 
     struct StubJwksFetcher {
-        responses: Mutex<VecDeque<KeyMap>>,
+        responses: Mutex<VecDeque<Result<KeyMap, JwtError>>>,
         fetch_count: AtomicUsize,
         delay: Duration,
     }
@@ -660,6 +648,17 @@ acIKunZfdeu3s95nsCD3HfSe
         }
 
         fn with_delay(responses: Vec<KeyMap>, delay: Duration) -> Arc<Self> {
+            Self::with_results_and_delay(responses.into_iter().map(Ok).collect(), delay)
+        }
+
+        fn with_results(responses: Vec<Result<KeyMap, JwtError>>) -> Arc<Self> {
+            Self::with_results_and_delay(responses, Duration::ZERO)
+        }
+
+        fn with_results_and_delay(
+            responses: Vec<Result<KeyMap, JwtError>>,
+            delay: Duration,
+        ) -> Arc<Self> {
             Arc::new(Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 fetch_count: AtomicUsize::new(0),
@@ -679,12 +678,11 @@ acIKunZfdeu3s95nsCD3HfSe
                 if !self.delay.is_zero() {
                     tokio::time::sleep(self.delay).await;
                 }
-                Ok(self
-                    .responses
+                self.responses
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .expect("stub JWKS response"))
+                    .expect("stub JWKS response")
             })
         }
     }
@@ -864,6 +862,27 @@ acIKunZfdeu3s95nsCD3HfSe
 
         assert_eq!(identity.user_id, "user_123");
         assert_eq!(fetcher.fetch_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_kid_miss_refresh_does_not_throttle_next_retry() {
+        let clock = ManualClock::new();
+        let fetcher = StubJwksFetcher::with_results(vec![
+            Err(JwtError::JwksStatus(StatusCode::BAD_GATEWAY)),
+            Ok(keys_for("kid-2", KEY2_N)),
+        ]);
+        let client = client_with(keys_for("kid-1", KEY1_N), fetcher.clone(), clock);
+        let token = encode_token(Some("kid-2"), KEY2_PEM, &test_claims());
+
+        assert!(matches!(
+            client.verify(&token).await,
+            Err(JwtError::JwksStatus(StatusCode::BAD_GATEWAY))
+        ));
+
+        let identity = client.verify(&token).await.unwrap();
+
+        assert_eq!(identity.user_id, "user_123");
+        assert_eq!(fetcher.fetch_count(), 2);
     }
 
     #[tokio::test]
