@@ -35,6 +35,7 @@ use uuid::Uuid;
 const DEFAULT_SCROLLBACK_BYTES: usize = 1024 * 1024; // 1 MiB
 const PTY_READ_CHUNK: usize = 4096;
 const BROADCAST_CAPACITY: usize = 1024;
+const FIXED_TERM: &str = "xterm-256color";
 
 #[derive(Debug, Clone)]
 pub enum TerminalEvent {
@@ -103,10 +104,7 @@ impl TerminalManager {
 
         let mut cmd = CommandBuilder::new(&cmd_str);
         cmd.cwd(&workspace.worktree_path);
-        for (k, v) in std::env::vars() {
-            cmd.env(k, v);
-        }
-        cmd.env("TERM", "xterm-256color");
+        populate_terminal_env(&mut cmd, &payload.env);
 
         let child = pair
             .slave
@@ -257,6 +255,27 @@ impl TerminalManager {
     }
 }
 
+/// PTYs should not inherit daemon credentials. Start from an empty environment,
+/// copy only PATH, HOME, USER, SHELL, LANG, and LC_* from the daemon, then add
+/// request-scoped opt-ins.
+fn populate_terminal_env(cmd: &mut CommandBuilder, explicit_env: &HashMap<String, String>) {
+    cmd.env_clear();
+
+    for (key, value) in std::env::vars().filter(|(key, _)| is_allowed_daemon_env(key)) {
+        cmd.env(key, value);
+    }
+
+    for (key, value) in explicit_env {
+        cmd.env(key, value);
+    }
+
+    cmd.env("TERM", FIXED_TERM);
+}
+
+fn is_allowed_daemon_env(key: &str) -> bool {
+    matches!(key, "PATH" | "HOME" | "USER" | "SHELL" | "LANG") || key.starts_with("LC_")
+}
+
 fn reader_loop(
     mut reader: Box<dyn Read + Send>,
     handle: Arc<TerminalHandle>,
@@ -320,4 +339,148 @@ fn waiter_loop(
         exit_code,
     });
     info!(terminal_id, ?exit_code, "terminal exited");
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+    use chrono::Utc;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::broadcast::error::RecvError;
+
+    struct EnvVarGuard {
+        key: String,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                previous,
+            }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(&self.key, value),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
+
+    fn fake_workspace(worktree: PathBuf) -> Workspace {
+        Workspace {
+            id: "ws-test".to_string(),
+            title: None,
+            project_root: worktree.clone(),
+            base_branch: "main".to_string(),
+            branch: "test".to_string(),
+            worktree_path: worktree,
+            created_at: Utc::now(),
+            archived_at: None,
+        }
+    }
+
+    async fn run_env_terminal(explicit_env: HashMap<String, String>) -> String {
+        let tmp = TempDir::new().unwrap();
+        let workspace = fake_workspace(tmp.path().to_path_buf());
+        let manager = TerminalManager::new();
+        let mut events = manager.subscribe();
+        let terminal = manager
+            .create(
+                &workspace,
+                CreateTerminalPayload {
+                    workspace_id: workspace.id.clone(),
+                    command: Some("/usr/bin/env".to_string()),
+                    env: explicit_env,
+                    cols: 80,
+                    rows: 24,
+                },
+            )
+            .await
+            .unwrap();
+
+        wait_for_terminal_exit(&mut events, &terminal.id).await;
+        read_settled_scrollback(&manager, &terminal.id).await
+    }
+
+    async fn wait_for_terminal_exit(
+        events: &mut broadcast::Receiver<TerminalEvent>,
+        terminal_id: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events.recv().await {
+                    Ok(TerminalEvent::Exited {
+                        terminal_id: id, ..
+                    }) if id == terminal_id => break,
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => panic!("terminal event channel closed"),
+                }
+            }
+        })
+        .await
+        .expect("terminal did not exit");
+    }
+
+    async fn read_settled_scrollback(manager: &TerminalManager, terminal_id: &str) -> String {
+        let mut previous = Vec::new();
+        let mut stable_ticks = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+
+        loop {
+            let response = manager.scrollback(terminal_id).await.unwrap();
+            let bytes = BASE64.decode(response.data_b64).unwrap();
+            if !bytes.is_empty() && bytes == previous {
+                stable_ticks += 1;
+                if stable_ticks >= 2 {
+                    return String::from_utf8_lossy(&bytes).into_owned();
+                }
+            } else {
+                previous = bytes;
+                stable_ticks = 0;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "terminal scrollback did not settle"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_filters_daemon_environment() {
+        let _guard = EnvVarGuard::set("FAKE_API_KEY", "secret-from-daemon");
+
+        let output = run_env_terminal(HashMap::new()).await;
+
+        assert!(!output.contains("FAKE_API_KEY"));
+        assert!(!output.contains("secret-from-daemon"));
+        assert!(output.contains("TERM=xterm-256color"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn create_includes_explicit_environment() {
+        let output = run_env_terminal(HashMap::from([(
+            "CHARON_EXPLICIT_ENV".to_string(),
+            "forwarded".to_string(),
+        )]))
+        .await;
+
+        assert!(output.contains("CHARON_EXPLICIT_ENV=forwarded"));
+    }
 }

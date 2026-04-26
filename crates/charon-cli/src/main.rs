@@ -476,6 +476,7 @@ async fn probe_terminal(base_url: &str, slug: &str, project_root: &Path) -> Resu
             payload: CreateTerminalPayload {
                 workspace_id: workspace.id.clone(),
                 command: Some("/bin/sh".into()),
+                env: Default::default(),
                 cols: 80,
                 rows: 24,
             },
