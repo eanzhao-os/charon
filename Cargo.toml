@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/*"]
+members = [
+    "crates/charon-core",
+    "crates/charon-daemon",
+    "crates/charon-cli",
+    "crates/charon-desktop/src-tauri",
+]
 resolver = "3"
 
 [workspace.package]

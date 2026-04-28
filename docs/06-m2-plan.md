@@ -14,7 +14,7 @@
 | **M2.2 WS 协议** | `GET /api/v1/ws` 升级（JWT at upgrade only）；JSON envelope；帧命名空间起步 `Workspace.*`；60s 服务端 Ping；Hello 帧带 identity；Error 帧带原 request id；二进制 attachment 留给 M2.3/M2.4 真用得着再做 | M2.1 | ✅ 2026-04-25 |
 | **M2.3 File / Diff API** | 路径 sandbox（lexical `safe_join`，拒 `../` + 绝对路径）；`File.{List,Read,Write}` REST + WS（UTF-8 only，binary 留 M2.4）；`Diff.Get` shell-out `git diff` + `ls-files --others`，per-file unified diff | M2.2 | ✅ 2026-04-26 |
 | **M2.4 Terminal** | `portable-pty` 起 shell；scrollback 1 MiB ring buffer；resize / kill / list / scrollback / remove；server→client `Terminal.Output` 广播（base64-in-JSON）；`charon ws probe-terminal` 端到端 smoke | M2.2 | ✅ 2026-04-26 |
-| **M2.5 Tauri desktop shell** | `crates/charon-desktop`：Tauri v2 + React 19 + TanStack + Tailwind 4；NyxID OAuth in webview → UserService 发现 → WS 连接；workspace 树 / diff 视图 / xterm.js terminal | M2.2-M2.4 | ⏳ |
+| **M2.5 Tauri desktop shell** | `crates/charon-desktop`：Tauri v2 + React 19 + Vite + Tailwind 4；NyxID OAuth in webview → UserService 发现 → WS 连接；workspace 树 / diff 视图 / xterm.js terminal | M2.2-M2.4 | 🚧 进行中（M2.5.0 ✅ 2026-04-28） |
 | **M2.6 `charon link` + 配置收尾** | 自动化 `nyxid node register` + `nyxid service add`，把 slug/credential 写到 `~/.charon/config.toml`；`charon doctor` 改读 config 而不是 `DEFAULT_USER_SERVICE_SLUG` | 任意时机 | ⏳ |
 
 预估：M2.1 + M2.2 + M2.6 共 3-5 天；M2.3 + M2.4 各 2-3 天；M2.5 是大头 1-2 周看 UI 复杂度。整体 3-4 周。
@@ -198,6 +198,38 @@ DEBUG charon_daemon::ws: WS close from client
 - **Terminal subscriptions 不做**：所有 WS session 收所有 terminal 事件，client 自己按 terminal_id filter。简单，单用户场景够。多用户/多 client 真排队再考虑 explicit Subscribe / Unsubscribe。
 - **Terminal GC 采用显式 remove**：`Exited` 后立即释放 PTY master/writer/child/killer；handle 暂留在 manager，方便事后查 list/scrollback。客户端调用 `Terminal.Remove` 后从 manager 删除；运行中的 terminal 拒绝 remove。
 - **continue 语句而不是 if-let-else**：每个 dispatch arm 自己手写 match-fetch-workspace-or-error，没抽 helper。9 个 arm 共有这个 pattern；后续重构时再合并。
+
+## M2.5 实施进度（live log）
+
+M2.5 拆成 6 个 phase，按依赖递进：
+
+| Phase | 范围 | 状态 |
+|---|---|---|
+| **M2.5.0** Scaffold | workspace 加 `crates/charon-desktop/src-tauri` member；Tauri 2 Rust 端编过；Vite + React 19 + Tailwind 4 + TS 前端结构落地（hello world App） | ✅ 2026-04-28 |
+| **M2.5.1** NyxID auth | OAuth in webview / token capture；frontend 调 daemon 的 `/api/v1/whoami` 拿 identity；WS connect 到 `/api/v1/ws` | ⏳ |
+| **M2.5.2** UserService discovery | NyxID `/api/v1/user-services` 列表 → 找 `charon-echo-poc` slug → 拼 wss URL；Hello frame 拿到 daemon 信息 | ⏳ |
+| **M2.5.3** Workspace tree UI | 左侧栏 workspace 列表 + 当前选中；`Workspace.List/Create/Archive`；展开后 `File.List` tree | ⏳ |
+| **M2.5.4** File / Diff viewer | 选中文件 `File.Read` 渲染（Monaco / CodeMirror）；右侧 `Diff.Get` 视图（diff renderer 库） | ⏳ |
+| **M2.5.5** Terminal | xterm.js + WS bridge：`Terminal.Create / SendKeys / Resize / Output (base64)`；多 terminal tab | ⏳ |
+
+### M2.5.0 落地（2026-04-28）
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| Workspace `Cargo.toml` 加 src-tauri 显式 member | ✅ | 从 `members = ["crates/*"]` 改成显式 4 项列表，避免 `crates/charon-desktop/`（frontend dir）被 cargo 当 crate |
+| Rust 端 (`crates/charon-desktop/src-tauri/`) | ✅ | `Cargo.toml`（tauri 2 + tauri-build 2）、`build.rs`、`tauri.conf.json`（bundle.active=false 跳 icon、devUrl 1420、frontendDist `../dist`）、`capabilities/default.json`（core:default permissions）、`src/lib.rs`（pub fn run）+ `src/main.rs`（thin wrapper） |
+| 前端 (`crates/charon-desktop/`) | ✅ | `package.json`（react 19 + react-dom 19 + @tauri-apps/api 2 + vite 7 + @vitejs/plugin-react 5 + tailwindcss 4 + @tailwindcss/vite 4 + typescript 5）、`index.html`、`vite.config.ts`（port 1420 + Tailwind plugin）、`tsconfig.json` + `tsconfig.node.json`、`src/{main.tsx, App.tsx, index.css}`（hello world + Tailwind dark bg） |
+| `cargo build -p charon-desktop` | ✅ | 编过；初次拉 tauri 依赖树需一两分钟，之后增量 ~10s |
+| `cargo build --workspace` + clippy + test | ✅ | 0 warning；39 tests passed |
+| `pnpm install` + `pnpm tauri dev` 实地启动窗口 | ⏳ | 留给下一轮：跑 pnpm install 拉 node_modules + 生成 lockfile，再 `pnpm tauri dev` 验"窗口确实开" |
+
+### M2.5.0 偏差 / 决策
+
+- **bundle.active=false**：Tauri 2 dev mode 仍硬要 `icons/icon.png` 存在（codegen 阶段）。塞了一个 67-byte 的 1×1 透明 PNG 占位 (`crates/charon-desktop/src-tauri/icons/icon.png`)。真正图标 M2.5.5 收尾时换。
+- **没用 `cargo create-tauri-app` / `pnpm create tauri-app`**：那俩 scaffolder 默认假设过强（特定的 worker 设置、TS config、目录命名）。手写让我们能直接复用 `workspace.dependencies` + `workspace.package`，并和 NyxID frontend 风格保持一致。
+- **TanStack Router/Query 还没装**：M2.5.0 hello world 不需要路由 / 数据层。M2.5.1-2 真要 OAuth 流 + 多 view 时再加。
+- **没装全局 `tauri-cli` cargo bin**：用 `@tauri-apps/cli` (npm devDep) 走 `pnpm tauri dev|build`，更自包含、CI 不用单独装。
+- **CSP=null**：dev 阶段方便。M2.5.5 收尾前要补严格 CSP（webview 严禁 inline script eval 等）。
 
 ### M2.3 偏差
 
