@@ -3,3 +3,7 @@ dist/
 .vite/
 *.log
 .DS_Store
+
+# Tauri codegen artifacts (regenerated on every build)
+src-tauri/gen/
+src-tauri/target/
